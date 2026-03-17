@@ -358,27 +358,27 @@ function turretStat(def, lv, stat) {
 const ENEMY_DEFS = {
   scoutDrone: {
     name: '偵察ドローン', hp: 35, speed: 80, torpedoDmg: 12, score: 10, size: 10,
-    color: '#cc4455', drop: { iron: 3, gunpowder: 1, brass: 1 },
+    color: '#44aacc', drop: { iron: 3, gunpowder: 1, brass: 1 },
     behavior: 'orbit', orbits: 2, orbitRadius: 180,
   },
   fastDrone: {
     name: '高速ドローン', hp: 25, speed: 130, torpedoDmg: 15, score: 15, size: 9,
-    color: '#ee5566', drop: { iron: 2, electronics: 2, brass: 1 },
+    color: '#55cc88', drop: { iron: 2, electronics: 2, brass: 1 },
     behavior: 'strafe', strafeOffset: 100,
   },
   bomber: {
     name: '爆撃機', hp: 120, speed: 50, torpedoDmg: 40, score: 35, size: 18,
-    color: '#aa3366', drop: { iron: 8, gunpowder: 5, brass: 3 },
+    color: '#6688cc', drop: { iron: 8, gunpowder: 5, brass: 3 },
     behavior: 'orbit', orbits: 1, orbitRadius: 140,
   },
   heavyDrone: {
     name: '重装ドローン', hp: 200, speed: 40, torpedoDmg: 50, score: 55, size: 22,
-    color: '#884488', drop: { iron: 12, gunpowder: 8, electronics: 5, brass: 2 },
+    color: '#7766bb', drop: { iron: 12, gunpowder: 8, electronics: 5, brass: 2 },
     behavior: 'orbit', orbits: 2, orbitRadius: 120,
   },
   stealthDrone: {
     name: 'ステルス', hp: 50, speed: 110, torpedoDmg: 25, score: 30, size: 9,
-    color: '#555577', drop: { electronics: 8, brass: 3 },
+    color: '#4488aa', drop: { electronics: 8, brass: 3 },
     behavior: 'strafe', strafeOffset: 80, stealth: true,
   },
 };
@@ -406,7 +406,7 @@ const G = {
   dmgFlash: 0,
   notifications: [],
   announce: null,
-  buildUI: { selectedType: null, selectedSlot: null, mode: 'main' }, // main | slot
+  buildUI: { selectedType: null, selectedSlot: null, mode: 'main', demolishConfirm: null }, // main | slot; demolishConfirm = slotId awaiting confirm
 };
 
 const RES_NAME = { iron: '鉄塊', gunpowder: '火薬', electronics: '電子機器', brass: '真鍮' };
@@ -471,6 +471,45 @@ function upgradeCostFor(slot) {
   const cost = {};
   for (const [k, v] of Object.entries(def.upgradeCost)) cost[k] = Math.ceil(v * (1 + (t.level - 1) * 0.5));
   return cost;
+}
+
+// Calculate total resources invested in a turret (base cost + all upgrade costs)
+function totalInvestedCost(slot) {
+  const t = slot.turret;
+  if (!t) return {};
+  const def = TURRET_DEFS[t.type];
+  const total = {};
+  // Base build cost
+  for (const [k, v] of Object.entries(def.cost)) total[k] = (total[k] || 0) + v;
+  // Upgrade costs for each level gained (Lv1→Lv2, Lv2→Lv3, etc.)
+  for (let lv = 1; lv < t.level; lv++) {
+    for (const [k, v] of Object.entries(def.upgradeCost)) {
+      total[k] = (total[k] || 0) + Math.ceil(v * (1 + (lv - 1) * 0.5));
+    }
+  }
+  return total;
+}
+
+// Refund = half of total invested (rounded down)
+function demolishRefund(slot) {
+  const total = totalInvestedCost(slot);
+  const refund = {};
+  for (const [k, v] of Object.entries(total)) refund[k] = Math.floor(v / 2);
+  return refund;
+}
+
+function demolishTurret(slotId) {
+  const slot = G.ship.slots[slotId];
+  if (!slot || !slot.turret) return false;
+  const refund = demolishRefund(slot);
+  // Add refund to resources
+  for (const [k, v] of Object.entries(refund)) G.res[k] = (G.res[k] || 0) + v;
+  const name = TURRET_DEFS[slot.turret.type].name;
+  slot.turret = null;
+  G.buildUI.demolishConfirm = null; // clear confirmation
+  sfx('hit');
+  notify(`${name}を解体 — 資材回収`);
+  return true;
 }
 
 // ─── ENEMY SPAWN ────────────────────────────────────────
@@ -657,7 +696,7 @@ function update(dt) {
       setTimeout(() => {
         if (G.phase === 'playing') {
           G.phase = 'building';
-          G.buildUI = { selectedType: null, selectedSlot: null, mode: 'main' };
+          G.buildUI = { selectedType: null, selectedSlot: null, mode: 'main', demolishConfirm: null };
           notify('改修フェーズ — 砲台を設置・強化せよ');
         }
       }, 1200);
@@ -1845,11 +1884,11 @@ function renderBuildMain() {
     oy += optH + 6;
   }
 
-  // Existing turrets — upgrade section
+  // Existing turrets — upgrade & demolish section
   oy += 10;
   ctx.font = "700 14px 'Satoshi',sans-serif"; ctx.fillStyle = '#aabbcc';
   ctx.textAlign = 'center';
-  ctx.fillText('— 既存砲台の強化 —', panelX + panelW / 2, oy);
+  ctx.fillText('— 既存砲台の管理 —', panelX + panelW / 2, oy);
   oy += 20;
 
   for (const slot of G.ship.slots) {
@@ -1858,10 +1897,16 @@ function renderBuildMain() {
     const def = TURRET_DEFS[t.type];
     const cost = upgradeCostFor(slot);
     const afford = canAfford(cost);
+    const isConfirming = G.buildUI.demolishConfirm === slot.id;
+    const rowH = isConfirming ? 60 : 36;
     const y2 = oy;
 
-    ctx.fillStyle = 'rgba(255,255,255,0.03)';
-    rr(ctx, panelX + 10, y2, panelW - 20, 36, 4); ctx.fill();
+    ctx.fillStyle = isConfirming ? 'rgba(180,40,40,0.08)' : 'rgba(255,255,255,0.03)';
+    rr(ctx, panelX + 10, y2, panelW - 20, rowH, 4); ctx.fill();
+    if (isConfirming) {
+      ctx.strokeStyle = 'rgba(255,80,60,0.3)'; ctx.lineWidth = 1;
+      rr(ctx, panelX + 10, y2, panelW - 20, rowH, 4); ctx.stroke();
+    }
 
     ctx.textAlign = 'left'; ctx.font = "600 12px 'Satoshi',sans-serif";
     ctx.fillStyle = '#ccc';
@@ -1872,15 +1917,48 @@ function renderBuildMain() {
     const rng = Math.round(turretStat(def, t.level, 'range'));
     ctx.fillText(`DMG:${dmg} RNG:${rng}`, panelX + 22, y2 + 28);
 
-    // Upgrade button
-    const btnW = 60, btnH = 24, btnX = panelX + panelW - 78, btnY = y2 + 6;
-    ctx.fillStyle = afford ? '#01696f' : '#334';
-    rr(ctx, btnX, btnY, btnW, btnH, 4); ctx.fill();
-    ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = afford ? '#fff' : '#555';
-    ctx.textAlign = 'center';
-    ctx.fillText('強化', btnX + btnW / 2, btnY + btnH / 2 + 1);
+    if (!isConfirming) {
+      // Upgrade button
+      const btnW = 54, btnH = 24, btnX = panelX + panelW - 100, btnY = y2 + 6;
+      ctx.fillStyle = afford ? '#01696f' : '#334';
+      rr(ctx, btnX, btnY, btnW, btnH, 4); ctx.fill();
+      ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = afford ? '#fff' : '#555';
+      ctx.textAlign = 'center';
+      ctx.fillText('強化', btnX + btnW / 2, btnY + btnH / 2 + 1);
 
-    oy += 40;
+      // Demolish trigger button (small, separated)
+      const dBtnW = 28, dBtnH = 24, dBtnX = panelX + panelW - 40, dBtnY = y2 + 6;
+      ctx.fillStyle = 'rgba(120,40,40,0.4)';
+      rr(ctx, dBtnX, dBtnY, dBtnW, dBtnH, 4); ctx.fill();
+      ctx.font = "600 12px sans-serif"; ctx.fillStyle = '#aa5555';
+      ctx.textAlign = 'center';
+      ctx.fillText('×', dBtnX + dBtnW / 2, dBtnY + dBtnH / 2 + 1);
+    } else {
+      // Confirmation row: show refund + confirm/cancel
+      const refund = demolishRefund(slot);
+      ctx.font = "400 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#cc8866';
+      ctx.textAlign = 'left';
+      const refundText = '回収: ' + Object.entries(refund).filter(([,v]) => v > 0).map(([k,v]) => `${RES_NAME[k]}${v}`).join(' ');
+      ctx.fillText(refundText, panelX + 22, y2 + 44);
+
+      // Confirm button (red)
+      const cBtnW = 48, cBtnH = 20, cBtnX = panelX + panelW - 112, cBtnY = y2 + 36;
+      ctx.fillStyle = '#882222';
+      rr(ctx, cBtnX, cBtnY, cBtnW, cBtnH, 3); ctx.fill();
+      ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#ff8888';
+      ctx.textAlign = 'center';
+      ctx.fillText('解体', cBtnX + cBtnW / 2, cBtnY + cBtnH / 2 + 1);
+
+      // Cancel button
+      const xBtnW = 48, xBtnH = 20, xBtnX = panelX + panelW - 58, xBtnY = y2 + 36;
+      ctx.fillStyle = '#334';
+      rr(ctx, xBtnX, xBtnY, xBtnW, xBtnH, 3); ctx.fill();
+      ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#888';
+      ctx.textAlign = 'center';
+      ctx.fillText('取消', xBtnX + xBtnW / 2, xBtnY + xBtnH / 2 + 1);
+    }
+
+    oy += rowH + 4;
   }
 
   // Next wave button
@@ -2016,32 +2094,72 @@ function renderBuildMobile() {
     }
   }
 
-  // Existing turrets upgrade row
+  // Existing turrets upgrade & demolish row
   const upgY = panelY + 35 + (Math.ceil(types.length / 2)) * (optH + 6) + 6;
   const existingTurrets = G.ship.slots.filter(s => s.turret);
   if (existingTurrets.length > 0) {
     ctx.font = "600 11px 'Satoshi',sans-serif"; ctx.fillStyle = '#aabbcc';
     ctx.textAlign = 'center';
-    ctx.fillText('— 強化 —', CX, upgY);
+    ctx.fillText('— 管理 —', CX, upgY);
     let uy = upgY + 14;
     for (const slot of existingTurrets) {
       const t = slot.turret;
       const def = TURRET_DEFS[t.type];
       const cost = upgradeCostFor(slot);
       const afford = canAfford(cost);
+      const isConfirming = G.buildUI.demolishConfirm === slot.id;
+      const rowH = isConfirming ? 52 : 28;
 
-      ctx.fillStyle = 'rgba(255,255,255,0.03)';
-      rr(ctx, panelX + 10, uy, panelW - 20, 28, 4); ctx.fill();
+      ctx.fillStyle = isConfirming ? 'rgba(180,40,40,0.08)' : 'rgba(255,255,255,0.03)';
+      rr(ctx, panelX + 10, uy, panelW - 20, rowH, 4); ctx.fill();
+      if (isConfirming) {
+        ctx.strokeStyle = 'rgba(255,80,60,0.3)'; ctx.lineWidth = 1;
+        rr(ctx, panelX + 10, uy, panelW - 20, rowH, 4); ctx.stroke();
+      }
       ctx.textAlign = 'left'; ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#ccc';
       ctx.fillText(`${def.name} Lv.${t.level}`, panelX + 18, uy + 17);
 
-      const btnW = 48, btnH = 20, btnX = panelX + panelW - 58, btnY2 = uy + 4;
-      ctx.fillStyle = afford ? '#01696f' : '#334';
-      rr(ctx, btnX, btnY2, btnW, btnH, 3); ctx.fill();
-      ctx.font = "600 9px 'Satoshi',sans-serif"; ctx.fillStyle = afford ? '#fff' : '#555';
-      ctx.textAlign = 'center';
-      ctx.fillText('強化', btnX + btnW / 2, btnY2 + btnH / 2 + 1);
-      uy += 32;
+      if (!isConfirming) {
+        // Upgrade button
+        const btnW = 42, btnH = 20, btnX = panelX + panelW - 80, btnY2 = uy + 4;
+        ctx.fillStyle = afford ? '#01696f' : '#334';
+        rr(ctx, btnX, btnY2, btnW, btnH, 3); ctx.fill();
+        ctx.font = "600 9px 'Satoshi',sans-serif"; ctx.fillStyle = afford ? '#fff' : '#555';
+        ctx.textAlign = 'center';
+        ctx.fillText('強化', btnX + btnW / 2, btnY2 + btnH / 2 + 1);
+
+        // Demolish trigger (×)
+        const dBtnW = 24, dBtnH = 20, dBtnX = panelX + panelW - 34, dBtnY = uy + 4;
+        ctx.fillStyle = 'rgba(120,40,40,0.4)';
+        rr(ctx, dBtnX, dBtnY, dBtnW, dBtnH, 3); ctx.fill();
+        ctx.font = "600 11px sans-serif"; ctx.fillStyle = '#aa5555';
+        ctx.textAlign = 'center';
+        ctx.fillText('×', dBtnX + dBtnW / 2, dBtnY + dBtnH / 2 + 1);
+      } else {
+        // Confirmation: refund info + confirm/cancel
+        const refund = demolishRefund(slot);
+        ctx.font = "400 9px 'Satoshi',sans-serif"; ctx.fillStyle = '#cc8866';
+        ctx.textAlign = 'left';
+        const refundText = '回収: ' + Object.entries(refund).filter(([,v]) => v > 0).map(([k,v]) => `${RES_NAME[k]}${v}`).join(' ');
+        ctx.fillText(refundText, panelX + 18, uy + 36);
+
+        // Confirm demolish
+        const cBtnW = 42, cBtnH = 18, cBtnX = panelX + panelW - 96, cBtnY = uy + 30;
+        ctx.fillStyle = '#882222';
+        rr(ctx, cBtnX, cBtnY, cBtnW, cBtnH, 3); ctx.fill();
+        ctx.font = "600 9px 'Satoshi',sans-serif"; ctx.fillStyle = '#ff8888';
+        ctx.textAlign = 'center';
+        ctx.fillText('解体', cBtnX + cBtnW / 2, cBtnY + cBtnH / 2 + 1);
+
+        // Cancel
+        const xBtnW = 42, xBtnH = 18, xBtnX = panelX + panelW - 48, xBtnY = uy + 30;
+        ctx.fillStyle = '#334';
+        rr(ctx, xBtnX, xBtnY, xBtnW, xBtnH, 3); ctx.fill();
+        ctx.font = "600 9px 'Satoshi',sans-serif"; ctx.fillStyle = '#888';
+        ctx.textAlign = 'center';
+        ctx.fillText('取消', xBtnX + xBtnW / 2, xBtnY + xBtnH / 2 + 1);
+      }
+      uy += rowH + 4;
     }
   }
 
@@ -2088,16 +2206,41 @@ function handleBuildClick() {
     oy += optH + 6;
   }
 
-  // Check upgrade buttons
+  // Check upgrade / demolish buttons
   oy += 30; // skip header
   for (const slot of G.ship.slots) {
     if (!slot.turret) continue;
-    const btnW = 60, btnX = panelX + panelW - 78, btnY = oy + 6;
-    if (mx > btnX && mx < btnX + btnW && my > btnY && my < btnY + 24) {
-      upgradeTurret(slot.id);
-      return;
+    const isConfirming = G.buildUI.demolishConfirm === slot.id;
+    const rowH = isConfirming ? 60 : 36;
+
+    if (!isConfirming) {
+      // Upgrade button
+      const btnW = 54, btnX = panelX + panelW - 100, btnY = oy + 6;
+      if (mx > btnX && mx < btnX + btnW && my > btnY && my < btnY + 24) {
+        upgradeTurret(slot.id);
+        return;
+      }
+      // Demolish trigger (× button)
+      const dBtnW = 28, dBtnX = panelX + panelW - 40, dBtnY = oy + 6;
+      if (mx > dBtnX && mx < dBtnX + dBtnW && my > dBtnY && my < dBtnY + 24) {
+        G.buildUI.demolishConfirm = slot.id;
+        return;
+      }
+    } else {
+      // Confirm demolish button
+      const cBtnW = 48, cBtnX = panelX + panelW - 112, cBtnY = oy + 36;
+      if (mx > cBtnX && mx < cBtnX + cBtnW && my > cBtnY && my < cBtnY + 20) {
+        demolishTurret(slot.id);
+        return;
+      }
+      // Cancel button
+      const xBtnW = 48, xBtnX = panelX + panelW - 58, xBtnY = oy + 36;
+      if (mx > xBtnX && mx < xBtnX + xBtnW && my > xBtnY && my < xBtnY + 20) {
+        G.buildUI.demolishConfirm = null;
+        return;
+      }
     }
-    oy += 40;
+    oy += rowH + 4;
   }
 
   // Check next wave button
@@ -2106,6 +2249,7 @@ function handleBuildClick() {
     G.phase = 'playing';
     startWave(G.wave + 1);
     G.buildUI.selectedType = null;
+    G.buildUI.demolishConfirm = null;
     return;
   }
 
@@ -2179,17 +2323,42 @@ function handleBuildClickMobile(mx, my) {
     }
   }
 
-  // Upgrade buttons
+  // Upgrade / demolish buttons
   const upgY = panelY + 35 + (Math.ceil(types.length / 2)) * (optH + 6) + 6;
   const existingTurrets = G.ship.slots.filter(s => s.turret);
   let uy = upgY + 14;
   for (const slot of existingTurrets) {
-    const btnW = 48, btnX = panelX + panelW - 58, btnY2 = uy + 4;
-    if (mx > btnX && mx < btnX + btnW && my > btnY2 && my < btnY2 + 20) {
-      upgradeTurret(slot.id);
-      return;
+    const isConfirming = G.buildUI.demolishConfirm === slot.id;
+    const rowH = isConfirming ? 52 : 28;
+
+    if (!isConfirming) {
+      // Upgrade button
+      const btnW = 42, btnX = panelX + panelW - 80, btnY2 = uy + 4;
+      if (mx > btnX && mx < btnX + btnW && my > btnY2 && my < btnY2 + 20) {
+        upgradeTurret(slot.id);
+        return;
+      }
+      // Demolish trigger (×)
+      const dBtnW = 24, dBtnX = panelX + panelW - 34, dBtnY = uy + 4;
+      if (mx > dBtnX && mx < dBtnX + dBtnW && my > dBtnY && my < dBtnY + 20) {
+        G.buildUI.demolishConfirm = slot.id;
+        return;
+      }
+    } else {
+      // Confirm demolish
+      const cBtnW = 42, cBtnX = panelX + panelW - 96, cBtnY = uy + 30;
+      if (mx > cBtnX && mx < cBtnX + cBtnW && my > cBtnY && my < cBtnY + 18) {
+        demolishTurret(slot.id);
+        return;
+      }
+      // Cancel
+      const xBtnW = 42, xBtnX = panelX + panelW - 48, xBtnY = uy + 30;
+      if (mx > xBtnX && mx < xBtnX + xBtnW && my > xBtnY && my < xBtnY + 18) {
+        G.buildUI.demolishConfirm = null;
+        return;
+      }
     }
-    uy += 32;
+    uy += rowH + 4;
   }
 
   // Next wave button
@@ -2198,6 +2367,7 @@ function handleBuildClickMobile(mx, my) {
     G.phase = 'playing';
     startWave(G.wave + 1);
     G.buildUI.selectedType = null;
+    G.buildUI.demolishConfirm = null;
     return;
   }
 }
