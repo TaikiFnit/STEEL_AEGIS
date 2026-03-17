@@ -21,6 +21,19 @@ function shortAngle(from, to, maxStep) {
   const d = angleDiff(from, to);
   return from + clamp(d, -maxStep, maxStep);
 }
+// Color lerp: parse hex, blend toward target
+function hexToRgb(hex) {
+  const h = hex.replace('#', '');
+  return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
+}
+function lerpColor(hex1, hex2, t) {
+  const [r1, g1, b1] = hexToRgb(hex1);
+  const [r2, g2, b2] = hexToRgb(hex2);
+  const r = Math.round(lerp(r1, r2, t));
+  const g = Math.round(lerp(g1, g2, t));
+  const b = Math.round(lerp(b1, b2, t));
+  return `rgb(${r},${g},${b})`;
+}
 
 // ─── CANVAS ─────────────────────────────────────────────
 const canvas = document.getElementById('gameCanvas');
@@ -345,12 +358,12 @@ function turretStat(def, lv, stat) {
 const ENEMY_DEFS = {
   scoutDrone: {
     name: '偵察ドローン', hp: 35, speed: 80, torpedoDmg: 12, score: 10, size: 10,
-    color: '#cc4455', drop: { iron: 3, gunpowder: 1 },
+    color: '#cc4455', drop: { iron: 3, gunpowder: 1, brass: 1 },
     behavior: 'orbit', orbits: 2, orbitRadius: 180,
   },
   fastDrone: {
     name: '高速ドローン', hp: 25, speed: 130, torpedoDmg: 15, score: 15, size: 9,
-    color: '#ee5566', drop: { iron: 2, electronics: 2 },
+    color: '#ee5566', drop: { iron: 2, electronics: 2, brass: 1 },
     behavior: 'strafe', strafeOffset: 100,
   },
   bomber: {
@@ -473,9 +486,11 @@ function spawnEnemy(type) {
   const orbitDir = Math.random() < 0.5 ? 1 : -1; // clockwise or counter
   const orbitAngle = ang(G.ship.x, G.ship.y, ex, ey); // angle FROM ship TO enemy
 
+  const hpScale = G.waveHpScale || 1;
+  const scaledHp = Math.round(def.hp * hpScale);
   const enemy = {
     type, x: ex, y: ey,
-    hp: def.hp, maxHp: def.hp,
+    hp: scaledHp, maxHp: scaledHp,
     speed: def.speed,
     torpedoDmg: def.torpedoDmg,
     size: def.size, color: def.color,
@@ -498,6 +513,7 @@ function spawnEnemy(type) {
     torpedoReady: false,
     torpedoDropped: false,
     retreatAngle: 0,
+    threatLevel: 0, // 0=safe, 1=about to fire
   };
   G.enemies.push(enemy);
 }
@@ -506,13 +522,19 @@ function spawnEnemy(type) {
 function dropTorpedo(enemy) {
   const tgtX = G.ship.x + rand(-30, 30);
   const tgtY = G.ship.y + rand(-15, 15);
+  // Torpedo speed: slow and menacing (gives player time to shoot it down)
+  // Damage-based scaling: heavier enemies launch slightly faster torpedoes
+  const baseTorpSpeed = enemy.torpedoDmg >= 40 ? 110 : 90;
   G.torpedoes.push({
     x: enemy.x, y: enemy.y,
     tx: tgtX, ty: tgtY,
-    speed: 250,
+    speed: baseTorpSpeed,
     damage: enemy.torpedoDmg,
-    life: 3.0,
+    hp: enemy.torpedoDmg >= 40 ? 30 : 15, // shootable! heavier torpedoes take more hits
+    maxHp: enemy.torpedoDmg >= 40 ? 30 : 15,
+    life: 6.0, // longer life since slower
     trail: [],
+    hitFlash: 0,
   });
   sfx('torpedo');
   enemy.torpedoDropped = true;
@@ -580,6 +602,9 @@ function startWave(idx) {
   G.spawnQueues = [];
   const w = WAVES[Math.min(idx, WAVES.length - 1)];
   const scale = idx >= WAVES.length ? 1 + (idx - WAVES.length + 1) * 0.3 : 1;
+  // HP scales with wave index: enemies get tougher each wave
+  // Gentle early, steeper later (wave 0=1x, wave 3=1.3x, wave 6=1.6x, wave 9=2.0x)
+  G.waveHpScale = 1 + idx * 0.1;
   for (const g of w.groups) {
     G.spawnQueues.push({
       type: g.type, remaining: Math.ceil(g.count * scale),
@@ -672,6 +697,28 @@ function updateEnemyAI(dt) {
 
     const dToShip = dist(e.x, e.y, sx, sy);
 
+    // ── Threat level computation (0=safe, 1=imminent torpedo) ──
+    if (e.phase === 'attack') {
+      e.threatLevel = 1.0;
+    } else if (e.phase === 'orbit') {
+      const def = ENEMY_DEFS[e.type];
+      const totalOrbits = def.orbits || 1;
+      const progress = (totalOrbits - e.orbitsRemaining) / totalOrbits;
+      // Also factor in phaseTimer within current orbit
+      const spd2 = e.speed * e.slowFactor;
+      const orbitPeriod = (TAU * e.orbitRadius) / Math.max(spd2, 1);
+      const orbitFrac = orbitPeriod > 0 ? e.phaseTimer / orbitPeriod : 0;
+      e.threatLevel = clamp(progress + orbitFrac / totalOrbits, 0, 0.95);
+    } else if (e.phase === 'strafe') {
+      // Threat rises as phaseTimer approaches 1.5s and drone nears ship
+      const timeThreat = clamp(e.phaseTimer / 1.5, 0, 1);
+      const distThreat = clamp(1 - dToShip / (e.strafeOffset + 150), 0, 1);
+      e.threatLevel = clamp(Math.max(timeThreat, distThreat), 0, e.torpedoDropped ? 0.2 : 1.0);
+    } else if (e.phase === 'retreat' || e.phase === 'approach') {
+      // Slowly decay threat when retreating/approaching
+      e.threatLevel = Math.max(0, e.threatLevel - dt * 0.8);
+    }
+
     // State machine
     switch (e.phase) {
       case 'approach': {
@@ -690,6 +737,7 @@ function updateEnemyAI(dt) {
             e.orbitAngle = ang(sx, sy, e.x, e.y);
           } else {
             e.phase = 'strafe';
+            e.phaseTimer = 0; // reset timer for torpedo delay
             // Pick a strafe line across the ship
             const crossAngle = ang(e.x, e.y, sx, sy) + rand(-0.3, 0.3);
             e.angle = crossAngle;
@@ -735,8 +783,9 @@ function updateEnemyAI(dt) {
         e.x += Math.cos(e.angle) * spd * 1.3 * dt;
         e.y += Math.sin(e.angle) * spd * 1.3 * dt;
 
-        // Drop torpedo when passing close to ship
-        if (!e.torpedoDropped && dToShip < e.strafeOffset + 50) {
+        e.phaseTimer += dt;
+        // Drop torpedo when passing close to ship (with minimum delay after strafing starts)
+        if (!e.torpedoDropped && dToShip < e.strafeOffset + 50 && e.phaseTimer > 1.5) {
           dropTorpedo(e);
         }
 
@@ -957,6 +1006,16 @@ function updateTurretFiring(dt) {
       const diff = Math.abs(angleDiff(t.angle, toEnemy));
       if (diff < 20 * DEG) { targetInCone = true; break; }
     }
+    // Also check if any torpedo is in the aiming cone (shootable torpedoes)
+    if (!targetInCone) {
+      for (const torp of G.torpedoes) {
+        const d = dist(wx, wy, torp.x, torp.y);
+        if (d > range) continue;
+        const toTorp = ang(wx, wy, torp.x, torp.y);
+        const diff = Math.abs(angleDiff(t.angle, toTorp));
+        if (diff < 20 * DEG) { targetInCone = true; break; }
+      }
+    }
 
     // Jammer: AoE slow
     if (t.type === 'jammer') {
@@ -1047,30 +1106,49 @@ function updateBullets(dt) {
     if (b.life <= 0) { G.bullets.splice(i, 1); continue; }
 
     let hit = false;
-    for (const e of G.enemies) {
-      if (dist(b.x, b.y, e.x, e.y) < e.size + 4) {
-        e.hp -= b.damage;
-        e.hitFlash = 1.0;
+
+    // Check bullet vs torpedoes (shootable torpedoes!)
+    for (const torp of G.torpedoes) {
+      if (dist(b.x, b.y, torp.x, torp.y) < 18) {
+        torp.hp -= b.damage;
+        torp.hitFlash = 0.5;
         hit = true;
-        emitP(b.x, b.y, 5, {
-          angle: b.angle + PI, spread: 0.8,
-          colors: ['#ffcc44', '#ff8844'], spdMin: 50, spdMax: 150,
-          szMin: 1, szMax: 3, lifeMin: 0.08, lifeMax: 0.25, type: 'spark', gravity: 0,
+        emitP(b.x, b.y, 4, {
+          angle: b.angle + PI, spread: 1.0,
+          colors: ['#ff8844', '#ffcc44'], spdMin: 40, spdMax: 100,
+          szMin: 1, szMax: 2, lifeMin: 0.05, lifeMax: 0.15, type: 'spark', gravity: 0,
         });
-        if (b.aoe > 0) {
-          for (const e2 of G.enemies) {
-            if (e2 === e) continue;
-            const d2 = dist(b.x, b.y, e2.x, e2.y);
-            if (d2 < b.aoe) { e2.hp -= b.damage * (1 - d2 / b.aoe) * 0.5; e2.hitFlash = 0.5; }
-          }
-          emitP(b.x, b.y, 20, {
-            colors: ['#ff6644', '#ffaa44', '#ffdd66'],
-            spdMin: 40, spdMax: 120, szMin: 3, szMax: 8,
-            lifeMin: 0.2, lifeMax: 0.5, gravity: 0,
-          });
-          addShake(2); sfx('explode');
-        }
         break;
+      }
+    }
+
+    // Check bullet vs enemies
+    if (!hit) {
+      for (const e of G.enemies) {
+        if (dist(b.x, b.y, e.x, e.y) < e.size + 4) {
+          e.hp -= b.damage;
+          e.hitFlash = 1.0;
+          hit = true;
+          emitP(b.x, b.y, 5, {
+            angle: b.angle + PI, spread: 0.8,
+            colors: ['#ffcc44', '#ff8844'], spdMin: 50, spdMax: 150,
+            szMin: 1, szMax: 3, lifeMin: 0.08, lifeMax: 0.25, type: 'spark', gravity: 0,
+          });
+          if (b.aoe > 0) {
+            for (const e2 of G.enemies) {
+              if (e2 === e) continue;
+              const d2 = dist(b.x, b.y, e2.x, e2.y);
+              if (d2 < b.aoe) { e2.hp -= b.damage * (1 - d2 / b.aoe) * 0.5; e2.hitFlash = 0.5; }
+            }
+            emitP(b.x, b.y, 20, {
+              colors: ['#ff6644', '#ffaa44', '#ffdd66'],
+              spdMin: 40, spdMax: 120, szMin: 3, szMax: 8,
+              lifeMin: 0.2, lifeMax: 0.5, gravity: 0,
+            });
+            addShake(2); sfx('explode');
+          }
+          break;
+        }
       }
     }
     if (hit) G.bullets.splice(i, 1);
@@ -1081,6 +1159,27 @@ function updateBullets(dt) {
 function updateTorpedoes(dt) {
   for (let i = G.torpedoes.length - 1; i >= 0; i--) {
     const t = G.torpedoes[i];
+    if (t.hitFlash > 0) t.hitFlash -= dt * 5;
+
+    // Torpedo shot down by player!
+    if (t.hp <= 0) {
+      emitP(t.x, t.y, 20, {
+        colors: ['#ff8844', '#ffcc44', '#ffdd66', '#fff'],
+        spdMin: 60, spdMax: 200, szMin: 2, szMax: 6,
+        lifeMin: 0.2, lifeMax: 0.6, type: 'debris', gravity: 0,
+      });
+      emitP(t.x, t.y, 10, {
+        colors: ['#4488cc', '#66aaee'],
+        spdMin: 30, spdMax: 100, szMin: 1, szMax: 4,
+        lifeMin: 0.1, lifeMax: 0.3, type: 'circle',
+      });
+      sfx('explode');
+      addShake(1.5);
+      G.score += 5; // small reward for shooting down torpedoes
+      G.torpedoes.splice(i, 1);
+      continue;
+    }
+
     const a = ang(t.x, t.y, t.tx, t.ty);
     t.x += Math.cos(a) * t.speed * dt;
     t.y += Math.sin(a) * t.speed * dt;
@@ -1159,22 +1258,122 @@ function render() {
   renderBullets();
   drawParticles();
 
-  // Turret range indicators when pointer is active
-  if (pointers.size > 0) {
+  // ─── VISUAL AIM FEEDBACK ──────────────────────────────
+  if (pointers.size > 0 && G.phase === 'playing') {
+    const activePointers = [...pointers.values()];
+    const sortedPtrs = [...activePointers].sort((a, b) => a.startTime - b.startTime);
+    const ptrWorlds = sortedPtrs.map(p => screenToWorld(p.x, p.y));
+
     for (const slot of G.ship.slots) {
       if (!slot.turret || slot.turret.buildAnim > 0) continue;
-      const def = TURRET_DEFS[slot.turret.type];
+      const t = slot.turret;
+      const def = TURRET_DEFS[t.type];
       const wx = G.ship.x + slot.rx;
       const wy = G.ship.y + slot.ry;
-      const range = turretStat(def, slot.turret.level, 'range');
-      // Arc indicator
+      const range = turretStat(def, t.level, 'range');
+
+      // — (A) Fan-shaped firing arc (turret's movable range) —
       const arcStart = slot.baseFacing - def.arcLimit;
       const arcEnd = slot.baseFacing + def.arcLimit;
-      ctx.strokeStyle = `rgba(74,240,192,0.08)`;
+      const arcR = range * 0.45; // compact arc hint
+      ctx.save();
+      ctx.globalAlpha = 0.025;
+      ctx.fillStyle = '#4af0c0';
+      ctx.beginPath();
+      ctx.moveTo(wx, wy);
+      ctx.arc(wx, wy, arcR, arcStart, arcEnd);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      // Arc outline
+      ctx.strokeStyle = 'rgba(74,240,192,0.12)';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.arc(wx, wy, range, arcStart, arcEnd);
+      ctx.arc(wx, wy, arcR, arcStart, arcEnd);
       ctx.stroke();
+      // Radial lines at arc edges
+      ctx.strokeStyle = 'rgba(74,240,192,0.08)';
+      ctx.beginPath();
+      ctx.moveTo(wx, wy);
+      ctx.lineTo(wx + Math.cos(arcStart) * arcR, wy + Math.sin(arcStart) * arcR);
+      ctx.moveTo(wx, wy);
+      ctx.lineTo(wx + Math.cos(arcEnd) * arcR, wy + Math.sin(arcEnd) * arcR);
+      ctx.stroke();
+
+      // — Find which pointer this turret is tracking —
+      let assignedPtr = null;
+      let bestD = Infinity;
+      for (const pw of ptrWorlds) {
+        const wantAngle = ang(wx, wy, pw.x, pw.y);
+        const arcDiff = Math.abs(angleDiff(slot.baseFacing, wantAngle));
+        if (arcDiff > def.arcLimit) continue;
+        const d = dist(wx, wy, pw.x, pw.y);
+        if (d < bestD) { bestD = d; assignedPtr = pw; }
+      }
+
+      if (assignedPtr) {
+        const wantAngle = ang(wx, wy, assignedPtr.x, assignedPtr.y);
+        const aimDiff = Math.abs(angleDiff(t.angle, wantAngle));
+        // Convergence factor: 1 when misaligned, 0 when aligned
+        const convergence = clamp(aimDiff / (15 * DEG), 0, 1);
+
+        // — (B) Thin line from tap position to turret ("desire line") —
+        const lineAlpha = 0.12 + convergence * 0.18; // brighter when misaligned
+        ctx.save();
+        ctx.strokeStyle = `rgba(74,240,192,${lineAlpha})`;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 6]);
+        ctx.beginPath();
+        ctx.moveTo(wx, wy);
+        ctx.lineTo(assignedPtr.x, assignedPtr.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+
+        // Small reticle at tap position
+        ctx.save();
+        ctx.strokeStyle = `rgba(74,240,192,${lineAlpha})`;
+        ctx.lineWidth = 1;
+        const retSz = 5;
+        ctx.beginPath();
+        ctx.moveTo(assignedPtr.x - retSz, assignedPtr.y);
+        ctx.lineTo(assignedPtr.x + retSz, assignedPtr.y);
+        ctx.moveTo(assignedPtr.x, assignedPtr.y - retSz);
+        ctx.lineTo(assignedPtr.x, assignedPtr.y + retSz);
+        ctx.stroke();
+        ctx.restore();
+
+        // — (C) Current aim direction indicator (short solid line from turret) —
+        const aimLen = 28 + convergence * 12; // slightly longer when tracking
+        const aimAlpha = 0.2 + convergence * 0.35;
+        ctx.strokeStyle = `rgba(74,240,192,${aimAlpha})`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(wx, wy);
+        ctx.lineTo(wx + Math.cos(t.angle) * aimLen, wy + Math.sin(t.angle) * aimLen);
+        ctx.stroke();
+
+        // Small dot at the tip of aim direction
+        if (convergence > 0.15) {
+          ctx.fillStyle = `rgba(74,240,192,${aimAlpha * 0.7})`;
+          ctx.beginPath();
+          ctx.arc(wx + Math.cos(t.angle) * aimLen, wy + Math.sin(t.angle) * aimLen, 2, 0, TAU);
+          ctx.fill();
+        }
+      } else {
+        // Turret can't reach any pointer — show it's out of arc
+        // Dim the turret area slightly and show a subtle 'X' or no-go indicator
+        ctx.save();
+        ctx.globalAlpha = 0.15;
+        ctx.strokeStyle = '#ff6644';
+        ctx.lineWidth = 1.5;
+        const xSz = 6;
+        ctx.beginPath();
+        ctx.moveTo(wx - xSz, wy - xSz); ctx.lineTo(wx + xSz, wy + xSz);
+        ctx.moveTo(wx + xSz, wy - xSz); ctx.lineTo(wx - xSz, wy + xSz);
+        ctx.stroke();
+        ctx.restore();
+      }
     }
   }
 
@@ -1358,16 +1557,32 @@ function renderEnemies() {
     ctx.fillStyle = 'rgba(0,0,0,0.15)';
     ctx.beginPath(); ctx.ellipse(2, 2, sz * 1.2, sz * 0.6, 0, 0, TAU); ctx.fill();
 
-    const col = e.hitFlash > 0 ? '#ffffff' : e.color;
+    // Threat-based color: lerp from base color toward warning red
+    const threat = e.threatLevel || 0;
+    const baseCol = e.color;
+    const threatCol = threat > 0.05 ? lerpColor(baseCol, '#ff2222', threat * 0.8) : baseCol;
+    const col = e.hitFlash > 0 ? '#ffffff' : threatCol;
     ctx.fillStyle = col;
+
+    // Threat glow aura (intensifies as threat rises)
+    if (threat > 0.15) {
+      const pulse = (Math.sin(G.time * (4 + threat * 8)) + 1) * 0.5;
+      const glowAlpha = threat * 0.25 * (0.6 + pulse * 0.4);
+      ctx.fillStyle = `rgba(255,50,30,${glowAlpha})`;
+      ctx.beginPath(); ctx.arc(0, 0, sz + 3 + threat * 4, 0, TAU); ctx.fill();
+      ctx.fillStyle = col; // restore body color
+    }
 
     if (e.type === 'bomber' || e.type === 'heavyDrone') {
       ctx.beginPath();
       ctx.moveTo(sz, 0); ctx.lineTo(-sz * 0.5, -sz * 0.8);
       ctx.lineTo(-sz, 0); ctx.lineTo(-sz * 0.5, sz * 0.8); ctx.closePath(); ctx.fill();
-      ctx.fillStyle = e.hitFlash > 0 ? '#ddd' : `${e.color}88`;
+      const wingCol = e.hitFlash > 0 ? '#ddd' : (threat > 0.05 ? lerpColor(baseCol, '#ff2222', threat * 0.5) : baseCol);
+      ctx.globalAlpha = (e.stealth ? e.stealthAlpha : 1) * 0.5;
+      ctx.fillStyle = wingCol;
       ctx.fillRect(-sz * 0.3, -sz * 1.2, sz * 0.6, sz * 0.4);
       ctx.fillRect(-sz * 0.3, sz * 0.8, sz * 0.6, sz * 0.4);
+      ctx.globalAlpha = e.stealth ? e.stealthAlpha : 1;
     } else {
       ctx.beginPath();
       ctx.moveTo(sz, 0); ctx.lineTo(0, -sz * 0.6);
@@ -1381,16 +1596,13 @@ function renderEnemies() {
       }
     }
 
-    // Torpedo ready indicator (pulsing red)
-    if (e.phase === 'attack' || (e.phase === 'orbit' && e.orbitsRemaining <= 1)) {
-      const pulse = (Math.sin(G.time * 8) + 1) * 0.5;
-      ctx.fillStyle = `rgba(255,68,68,${0.3 + pulse * 0.4})`;
-      ctx.beginPath(); ctx.arc(0, 0, sz + 5, 0, TAU); ctx.fill();
-      // Warning icon
-      ctx.fillStyle = '#ff4444';
-      ctx.font = `bold ${sz}px sans-serif`;
+    // Warning icon at high threat
+    if (threat > 0.8) {
+      const pulse = (Math.sin(G.time * 10) + 1) * 0.5;
+      ctx.fillStyle = `rgba(255,68,68,${0.5 + pulse * 0.5})`;
+      ctx.font = `bold ${Math.round(sz * 0.9)}px sans-serif`;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText('!', 0, -sz - 6);
+      ctx.fillText('!', 0, -sz - 5);
     }
 
     // Slow ring
@@ -1399,8 +1611,12 @@ function renderEnemies() {
       ctx.beginPath(); ctx.arc(0, 0, sz + 4, 0, TAU * (e.slowTimer / 3)); ctx.stroke();
     }
 
-    // Engine
-    ctx.fillStyle = e.stealth ? 'rgba(100,100,200,0.3)' : 'rgba(255,100,50,0.5)';
+    // Engine (brighter when high threat)
+    const engAlpha = e.stealth ? 0.3 : (0.4 + threat * 0.4);
+    const engR = e.stealth ? 100 : Math.round(lerp(255, 255, threat));
+    const engG = e.stealth ? 100 : Math.round(lerp(130, 40, threat));
+    const engB = e.stealth ? 200 : Math.round(lerp(50, 20, threat));
+    ctx.fillStyle = `rgba(${engR},${engG},${engB},${engAlpha})`;
     ctx.beginPath(); ctx.arc(-sz * 0.6, 0, sz * 0.2 + Math.sin(G.time * 15), 0, TAU); ctx.fill();
 
     ctx.restore();
@@ -1453,9 +1669,22 @@ function renderTorpedoes() {
     // Body
     const a = ang(t.x, t.y, t.tx, t.ty);
     ctx.save(); ctx.translate(t.x, t.y); ctx.rotate(a);
-    ctx.fillStyle = '#ff6644'; ctx.fillRect(-6, -2, 12, 4);
-    ctx.fillStyle = '#ffaa44'; ctx.beginPath(); ctx.arc(-6, 0, 3, 0, TAU); ctx.fill();
+    const bodyCol = t.hitFlash > 0 ? '#ffffff' : '#ff6644';
+    ctx.fillStyle = bodyCol; ctx.fillRect(-6, -2, 12, 4);
+    ctx.fillStyle = t.hitFlash > 0 ? '#ffeecc' : '#ffaa44';
+    ctx.beginPath(); ctx.arc(-6, 0, 3, 0, TAU); ctx.fill();
     ctx.restore();
+
+    // HP bar (only when damaged)
+    if (t.hp < t.maxHp) {
+      const bw = 16, bh = 3;
+      const bx = t.x - bw / 2, by = t.y - 8;
+      const hp = clamp(t.hp / t.maxHp, 0, 1);
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; rr(ctx, bx, by, bw, bh, 1); ctx.fill();
+      ctx.fillStyle = hp > 0.5 ? '#ffaa44' : '#ff4466';
+      rr(ctx, bx, by, bw * hp, bh, 1); ctx.fill();
+    }
+
     // Target reticle
     const pulse = (Math.sin(G.time * 6) + 1) * 0.5;
     ctx.strokeStyle = `rgba(255,68,68,${0.2 + pulse * 0.3})`; ctx.lineWidth = 1;
@@ -2079,7 +2308,7 @@ function rr(c, x, y, w, h, r) {
 function startGame() {
   G.phase = 'playing';
   G.ship.hp = G.ship.maxHp;
-  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 0 };
+  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 4 };
   initSlots();
   placeTurret(0, 'machineGun'); // bow
   placeTurret(7, 'machineGun'); // stern
@@ -2094,7 +2323,7 @@ function resetGame() {
   G.dmgFlash = 0; shakeAmt = 0;
   particles.length = 0;
   G.ship.hp = G.ship.maxHp;
-  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 0 };
+  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 4 };
   initSlots();
   placeTurret(0, 'machineGun');
   placeTurret(7, 'machineGun');
