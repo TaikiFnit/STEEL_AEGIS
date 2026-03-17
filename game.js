@@ -1,0 +1,2143 @@
+// ═══════════════════════════════════════════════════════════
+// STEEL AEGIS v2 — TowerDefence x Battleship
+// Full rewrite: manual aiming, multi-touch, realistic flight
+// patterns, turret rotation limits, level-up system
+// ═══════════════════════════════════════════════════════════
+
+'use strict';
+
+const PI = Math.PI, TAU = PI * 2, DEG = PI / 180;
+const TICK = 1000 / 60;
+
+// ─── UTILITIES ──────────────────────────────────────────
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const rand = (lo, hi) => Math.random() * (hi - lo) + lo;
+const randInt = (lo, hi) => Math.floor(rand(lo, hi + 1));
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const ang = (x1, y1, x2, y2) => Math.atan2(y2 - y1, x2 - x1);
+function angleDiff(a, b) { let d = ((b - a) % TAU + TAU + PI) % TAU - PI; return d; }
+function shortAngle(from, to, maxStep) {
+  const d = angleDiff(from, to);
+  return from + clamp(d, -maxStep, maxStep);
+}
+
+// ─── CANVAS ─────────────────────────────────────────────
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let W, H, CX, CY;
+function resize() {
+  const dpr = Math.min(devicePixelRatio, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  CX = W / 2; CY = H / 2;
+}
+addEventListener('resize', resize); resize();
+
+// ─── TOUCH / POINTER SYSTEM ────────────────────────────
+// Tracks all active pointers (mouse + touches) for multi-aim
+const pointers = new Map(); // id -> {x, y, startTime}
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, startTime: Date.now() });
+  if (!audioCtx) initAudio();
+  if (G.phase === 'title') { startGame(); return; }
+  if (G.phase === 'gameover') { resetGame(); return; }
+});
+canvas.addEventListener('pointermove', e => {
+  if (pointers.has(e.pointerId)) {
+    const p = pointers.get(e.pointerId);
+    p.x = e.clientX; p.y = e.clientY;
+  }
+});
+canvas.addEventListener('pointerup', e => {
+  pointers.delete(e.pointerId);
+});
+canvas.addEventListener('pointercancel', e => {
+  pointers.delete(e.pointerId);
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// Convert screen coords to world coords
+function screenToWorld(sx, sy) {
+  return { x: sx - CX + G.ship.x - shakeOx, y: sy - CY + G.ship.y - shakeOy };
+}
+
+// Keyboard (for build UI shortcuts)
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ─── AUDIO ──────────────────────────────────────────────
+let audioCtx = null;
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (AudioContext || webkitAudioContext)();
+}
+function sfx(type) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  switch (type) {
+    case 'mg': {
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(180 + Math.random() * 120, t);
+      o.frequency.exponentialRampToValueAtTime(60, t + 0.06);
+      g.gain.setValueAtTime(0.07, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+      o.start(t); o.stop(t + 0.06);
+      // noise
+      const n = audioCtx.createBufferSource();
+      const b = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.04, audioCtx.sampleRate);
+      const d = b.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.4;
+      n.buffer = b;
+      const ng = audioCtx.createGain();
+      ng.gain.setValueAtTime(0.08, t);
+      ng.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+      n.connect(ng); ng.connect(audioCtx.destination);
+      n.start(t); n.stop(t + 0.04);
+      break;
+    }
+    case 'flak': {
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(100, t);
+      o.frequency.exponentialRampToValueAtTime(30, t + 0.25);
+      g.gain.setValueAtTime(0.14, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+      o.start(t); o.stop(t + 0.25);
+      break;
+    }
+    case 'explode': {
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(70, t);
+      o.frequency.exponentialRampToValueAtTime(15, t + 0.4);
+      g.gain.setValueAtTime(0.18, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+      o.start(t); o.stop(t + 0.4);
+      const eb = audioCtx.createBufferSource();
+      const ebuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.3, audioCtx.sampleRate);
+      const ed = ebuf.getChannelData(0);
+      for (let i = 0; i < ed.length; i++) ed[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.07));
+      eb.buffer = ebuf;
+      const eg = audioCtx.createGain();
+      eg.gain.setValueAtTime(0.18, t);
+      eg.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      eb.connect(eg); eg.connect(audioCtx.destination);
+      eb.start(t); eb.stop(t + 0.3);
+      break;
+    }
+    case 'missile': {
+      o.type = 'sine';
+      o.frequency.setValueAtTime(500, t);
+      o.frequency.exponentialRampToValueAtTime(1100, t + 0.15);
+      g.gain.setValueAtTime(0.06, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+      o.start(t); o.stop(t + 0.15);
+      break;
+    }
+    case 'jammer': {
+      o.type = 'sine';
+      o.frequency.setValueAtTime(1800, t);
+      o.frequency.setValueAtTime(2200, t + 0.05);
+      o.frequency.setValueAtTime(1600, t + 0.1);
+      g.gain.setValueAtTime(0.04, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+      o.start(t); o.stop(t + 0.2);
+      break;
+    }
+    case 'pickup': {
+      o.type = 'sine';
+      o.frequency.setValueAtTime(700, t);
+      o.frequency.exponentialRampToValueAtTime(1400, t + 0.08);
+      g.gain.setValueAtTime(0.06, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+      o.start(t); o.stop(t + 0.08);
+      break;
+    }
+    case 'build': {
+      o.type = 'triangle';
+      o.frequency.setValueAtTime(400, t);
+      o.frequency.exponentialRampToValueAtTime(800, t + 0.15);
+      g.gain.setValueAtTime(0.08, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      o.start(t); o.stop(t + 0.3);
+      break;
+    }
+    case 'wave': {
+      o.type = 'sine';
+      o.frequency.setValueAtTime(300, t);
+      o.frequency.exponentialRampToValueAtTime(600, t + 0.2);
+      o.frequency.setValueAtTime(600, t + 0.3);
+      o.frequency.exponentialRampToValueAtTime(900, t + 0.5);
+      g.gain.setValueAtTime(0.1, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+      o.start(t); o.stop(t + 0.5);
+      break;
+    }
+    case 'hit': {
+      o.type = 'square';
+      o.frequency.setValueAtTime(140, t);
+      o.frequency.exponentialRampToValueAtTime(50, t + 0.08);
+      g.gain.setValueAtTime(0.1, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+      o.start(t); o.stop(t + 0.08);
+      break;
+    }
+    case 'torpedo': {
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(200, t);
+      o.frequency.exponentialRampToValueAtTime(50, t + 0.5);
+      g.gain.setValueAtTime(0.15, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+      o.start(t); o.stop(t + 0.5);
+      // splash
+      const sb = audioCtx.createBufferSource();
+      const sbuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.4, audioCtx.sampleRate);
+      const sd = sbuf.getChannelData(0);
+      for (let i = 0; i < sd.length; i++) sd[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.1));
+      sb.buffer = sbuf;
+      const sg = audioCtx.createGain();
+      sg.gain.setValueAtTime(0.15, t + 0.1);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+      sb.connect(sg); sg.connect(audioCtx.destination);
+      sb.start(t + 0.1); sb.stop(t + 0.5);
+      break;
+    }
+    default: {
+      o.type = 'square'; o.frequency.value = 440;
+      g.gain.setValueAtTime(0.04, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+      o.start(t); o.stop(t + 0.1);
+    }
+  }
+}
+
+// ─── PARTICLES ──────────────────────────────────────────
+const particles = [];
+const MAX_PARTICLES = 3000;
+
+function emitP(x, y, count, cfg) {
+  for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+    const a = cfg.angle != null ? cfg.angle + rand(-(cfg.spread || PI), cfg.spread || PI) : rand(0, TAU);
+    const spd = rand(cfg.spdMin || 50, cfg.spdMax || 200);
+    particles.push({
+      x, y, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+      life: rand(cfg.lifeMin || 0.2, cfg.lifeMax || 0.8),
+      maxLife: 0, // set below
+      size: rand(cfg.szMin || 2, cfg.szMax || 5),
+      color: Array.isArray(cfg.colors) ? cfg.colors[randInt(0, cfg.colors.length - 1)] : (cfg.color || '#fff'),
+      type: cfg.type || 'circle',
+      rot: rand(0, TAU), rotSpd: rand(-5, 5),
+      gravity: cfg.gravity ?? 40,
+    });
+    particles[particles.length - 1].maxLife = particles[particles.length - 1].life;
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += p.gravity * dt;
+    p.life -= dt; p.rot += p.rotSpd * dt;
+    if (p.life <= 0) { particles.splice(i, 1); }
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = clamp(p.life / p.maxLife, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    if (p.type === 'debris') {
+      ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.6);
+    } else if (p.type === 'spark') {
+      ctx.strokeStyle = p.color; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(-p.size, 0); ctx.lineTo(p.size, 0); ctx.stroke();
+    } else if (p.type === 'ring') {
+      ctx.strokeStyle = p.color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, p.size * (1 - alpha) * 3 + 5, 0, TAU); ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.arc(0, 0, p.size * alpha, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+// ─── SCREEN SHAKE ───────────────────────────────────────
+let shakeAmt = 0, shakeOx = 0, shakeOy = 0;
+function addShake(v) { shakeAmt = Math.min(shakeAmt + v, 18); }
+function updateShake() {
+  if (shakeAmt > 0.4) {
+    shakeOx = (Math.random() - 0.5) * shakeAmt * 2;
+    shakeOy = (Math.random() - 0.5) * shakeAmt * 2;
+    shakeAmt *= 0.9;
+  } else { shakeAmt = 0; shakeOx = shakeOy = 0; }
+}
+
+// ─── TURRET DEFINITIONS ────────────────────────────────
+// Stats scale by level: base * (1 + 0.3 * (lv - 1))
+const TURRET_DEFS = {
+  machineGun: {
+    name: '機銃', desc: '高速連射対空機銃',
+    range: 220, fireRate: 0.07, damage: 8, bulletSpeed: 900,
+    barrels: 2, spread: 3 * DEG, tracerCol: '#ffcc33',
+    cost: { iron: 8, gunpowder: 4 },
+    upgradeCost: { iron: 6, gunpowder: 3 }, // per level
+    burstSize: 5, burstDelay: 0.04, burstCooldown: 0.35,
+    rotSpeed: 2.2 * DEG, // degrees per tick → radians per second (slow turret rotation)
+    arcLimit: 150 * DEG, // can aim 150° from its base facing
+  },
+  flak: {
+    name: '高射砲', desc: '空中炸裂弾 — 範囲ダメージ',
+    range: 320, fireRate: 1.2, damage: 45, bulletSpeed: 500,
+    barrels: 1, spread: 0, tracerCol: '#ff6622',
+    cost: { iron: 18, gunpowder: 12, brass: 4 },
+    upgradeCost: { iron: 12, gunpowder: 8, brass: 3 },
+    aoe: 65, burstSize: 1, burstDelay: 0, burstCooldown: 1.3,
+    rotSpeed: 1.5 * DEG,
+    arcLimit: 160 * DEG,
+  },
+  jammer: {
+    name: 'ジャマー', desc: '電子妨害 — 敵を減速',
+    range: 250, fireRate: 2.0, damage: 0, bulletSpeed: 0,
+    barrels: 0, spread: 0, tracerCol: '#b088ff',
+    cost: { iron: 12, electronics: 15 },
+    upgradeCost: { iron: 8, electronics: 10 },
+    slowFactor: 0.35, slowDuration: 3.5,
+    burstSize: 1, burstDelay: 0, burstCooldown: 2.0,
+    rotSpeed: 3.0 * DEG,
+    arcLimit: 180 * DEG, // full rotation
+  },
+  launcher: {
+    name: 'ミサイル', desc: '追尾ミサイル — 高火力',
+    range: 400, fireRate: 2.5, damage: 85, bulletSpeed: 300,
+    barrels: 1, spread: 0, tracerCol: '#ff4466',
+    cost: { iron: 22, gunpowder: 18, electronics: 8, brass: 4 },
+    upgradeCost: { iron: 15, gunpowder: 12, electronics: 6, brass: 3 },
+    homing: true, burstSize: 1, burstDelay: 0, burstCooldown: 2.8,
+    rotSpeed: 1.8 * DEG,
+    arcLimit: 140 * DEG,
+  },
+};
+
+function turretStat(def, lv, stat) {
+  const base = def[stat];
+  if (stat === 'damage' || stat === 'range') return base * (1 + 0.3 * (lv - 1));
+  if (stat === 'burstCooldown') return base / (1 + 0.15 * (lv - 1));
+  return base;
+}
+
+// ─── ENEMY DEFINITIONS ─────────────────────────────────
+// behavior: 'orbit' = circles the ship N times then attacks
+//           'strafe' = flies across the ship
+//           'dive'   = dives straight at ship
+const ENEMY_DEFS = {
+  scoutDrone: {
+    name: '偵察ドローン', hp: 35, speed: 80, torpedoDmg: 12, score: 10, size: 10,
+    color: '#cc4455', drop: { iron: 3, gunpowder: 1 },
+    behavior: 'orbit', orbits: 2, orbitRadius: 180,
+  },
+  fastDrone: {
+    name: '高速ドローン', hp: 25, speed: 130, torpedoDmg: 15, score: 15, size: 9,
+    color: '#ee5566', drop: { iron: 2, electronics: 2 },
+    behavior: 'strafe', strafeOffset: 100,
+  },
+  bomber: {
+    name: '爆撃機', hp: 120, speed: 50, torpedoDmg: 40, score: 35, size: 18,
+    color: '#aa3366', drop: { iron: 8, gunpowder: 5, brass: 3 },
+    behavior: 'orbit', orbits: 1, orbitRadius: 140,
+  },
+  heavyDrone: {
+    name: '重装ドローン', hp: 200, speed: 40, torpedoDmg: 50, score: 55, size: 22,
+    color: '#884488', drop: { iron: 12, gunpowder: 8, electronics: 5, brass: 2 },
+    behavior: 'orbit', orbits: 2, orbitRadius: 120,
+  },
+  stealthDrone: {
+    name: 'ステルス', hp: 50, speed: 110, torpedoDmg: 25, score: 30, size: 9,
+    color: '#555577', drop: { electronics: 8, brass: 3 },
+    behavior: 'strafe', strafeOffset: 80, stealth: true,
+  },
+};
+
+// ─── GAME STATE ─────────────────────────────────────────
+const G = {
+  phase: 'title', // title | playing | building | gameover
+  time: 0,
+  wave: 0,
+  score: 0,
+  kills: 0,
+  ship: {
+    x: 0, y: 0,
+    hp: 120, maxHp: 120,
+    w: 120, h: 40,
+    slots: [],
+  },
+  res: { iron: 0, gunpowder: 0, electronics: 0, brass: 0 },
+  enemies: [],
+  bullets: [],
+  scraps: [],
+  torpedoes: [],   // incoming torpedoes/bombs
+  spawnQueues: [],
+  waveActive: false,
+  dmgFlash: 0,
+  notifications: [],
+  announce: null,
+  buildUI: { selectedType: null, selectedSlot: null, mode: 'main' }, // main | slot
+};
+
+const RES_NAME = { iron: '鉄塊', gunpowder: '火薬', electronics: '電子機器', brass: '真鍮' };
+const RES_COL = { iron: '#7ec8e3', gunpowder: '#ff8844', electronics: '#b088ff', brass: '#ffd700' };
+
+// ─── SHIP SLOTS ─────────────────────────────────────────
+// baseFacing: the "natural" direction each turret faces (radians)
+// Turrets can rotate arcLimit from this base facing
+function initSlots() {
+  const s = G.ship;
+  s.slots = [
+    { rx: 48, ry: 0,   baseFacing: 0,       turret: null, id: 0 },        // bow
+    { rx: 25, ry: -16,  baseFacing: -PI/4,   turret: null, id: 1 },        // fwd-port
+    { rx: 25, ry: 16,   baseFacing: PI/4,    turret: null, id: 2 },        // fwd-star
+    { rx: 0,  ry: -20,  baseFacing: -PI/2,   turret: null, id: 3 },        // mid-port
+    { rx: 0,  ry: 20,   baseFacing: PI/2,    turret: null, id: 4 },        // mid-star
+    { rx: -28, ry: -16, baseFacing: -3*PI/4, turret: null, id: 5 },        // aft-port
+    { rx: -28, ry: 16,  baseFacing: 3*PI/4,  turret: null, id: 6 },        // aft-star
+    { rx: -48, ry: 0,   baseFacing: PI,      turret: null, id: 7 },        // stern
+  ];
+}
+
+function placeTurret(slotId, type) {
+  const slot = G.ship.slots[slotId];
+  if (!slot || slot.turret) return false;
+  const def = TURRET_DEFS[type];
+  slot.turret = {
+    type, level: 1,
+    angle: slot.baseFacing, // starts facing its base direction
+    targetAngle: slot.baseFacing,
+    cooldown: 0, burstCount: 0, burstTimer: 0,
+    recoil: 0,
+    buildAnim: 1.0,
+  };
+  return true;
+}
+
+function upgradeTurret(slotId) {
+  const slot = G.ship.slots[slotId];
+  if (!slot || !slot.turret) return false;
+  const t = slot.turret;
+  const def = TURRET_DEFS[t.type];
+  const cost = {};
+  for (const [k, v] of Object.entries(def.upgradeCost)) cost[k] = Math.ceil(v * (1 + (t.level - 1) * 0.5));
+  if (!canAfford(cost)) return false;
+  spend(cost);
+  t.level++;
+  sfx('build');
+  return true;
+}
+
+function canAfford(cost) {
+  for (const [k, v] of Object.entries(cost)) if ((G.res[k] || 0) < v) return false;
+  return true;
+}
+function spend(cost) {
+  for (const [k, v] of Object.entries(cost)) G.res[k] -= v;
+}
+function upgradeCostFor(slot) {
+  const t = slot.turret;
+  const def = TURRET_DEFS[t.type];
+  const cost = {};
+  for (const [k, v] of Object.entries(def.upgradeCost)) cost[k] = Math.ceil(v * (1 + (t.level - 1) * 0.5));
+  return cost;
+}
+
+// ─── ENEMY SPAWN ────────────────────────────────────────
+function spawnEnemy(type) {
+  const def = ENEMY_DEFS[type];
+  if (!def) return;
+  // Spawn from random edge
+  const spawnAngle = rand(0, TAU);
+  const spawnDist = 550 + rand(0, 100);
+  const ex = G.ship.x + Math.cos(spawnAngle) * spawnDist;
+  const ey = G.ship.y + Math.sin(spawnAngle) * spawnDist;
+
+  const orbitDir = Math.random() < 0.5 ? 1 : -1; // clockwise or counter
+  const orbitAngle = ang(G.ship.x, G.ship.y, ex, ey); // angle FROM ship TO enemy
+
+  const enemy = {
+    type, x: ex, y: ey,
+    hp: def.hp, maxHp: def.hp,
+    speed: def.speed,
+    torpedoDmg: def.torpedoDmg,
+    size: def.size, color: def.color,
+    drop: { ...def.drop }, score: def.score,
+    stealth: def.stealth || false,
+    stealthAlpha: def.stealth ? 0.15 : 1.0,
+    slowTimer: 0, slowFactor: 1.0,
+    hitFlash: 0,
+    angle: ang(ex, ey, G.ship.x, G.ship.y), // facing ship
+    // Flight behavior state
+    behavior: def.behavior,
+    phase: 'approach', // approach | orbit | strafe | attack | retreat | dead
+    orbitDir,
+    orbitAngle,
+    orbitsRemaining: def.orbits || 1,
+    orbitRadius: def.orbitRadius || 160,
+    strafeOffset: def.strafeOffset || 100,
+    strafeTarget: null,
+    phaseTimer: 0,
+    torpedoReady: false,
+    torpedoDropped: false,
+    retreatAngle: 0,
+  };
+  G.enemies.push(enemy);
+}
+
+// ─── TORPEDO (enemy attack) ─────────────────────────────
+function dropTorpedo(enemy) {
+  const tgtX = G.ship.x + rand(-30, 30);
+  const tgtY = G.ship.y + rand(-15, 15);
+  G.torpedoes.push({
+    x: enemy.x, y: enemy.y,
+    tx: tgtX, ty: tgtY,
+    speed: 250,
+    damage: enemy.torpedoDmg,
+    life: 3.0,
+    trail: [],
+  });
+  sfx('torpedo');
+  enemy.torpedoDropped = true;
+}
+
+// ─── BULLETS ────────────────────────────────────────────
+function spawnBullet(x, y, angle, speed, damage, color, opts = {}) {
+  G.bullets.push({
+    x, y, angle, speed, damage, color,
+    aoe: opts.aoe || 0,
+    homing: opts.homing || false,
+    target: opts.target || null,
+    life: 2.0,
+    trail: [],
+  });
+}
+
+// ─── SCRAP ──────────────────────────────────────────────
+function spawnScrap(x, y, resources) {
+  for (const [key, amount] of Object.entries(resources)) {
+    if (amount <= 0) continue;
+    for (let i = 0; i < amount; i++) {
+      G.scraps.push({
+        x: x + rand(-25, 25), y: y + rand(-25, 25),
+        vx: rand(-50, 50), vy: rand(-50, 50),
+        type: key, value: 1,
+        life: 20,
+        size: rand(3, 6),
+        rot: rand(0, TAU), rotSpd: rand(-3, 3),
+      });
+    }
+  }
+}
+
+// ─── WAVES ──────────────────────────────────────────────
+function genWaves() {
+  return [
+    // W1: gentle intro — few slow drones orbit lazily
+    { groups: [{ type: 'scoutDrone', count: 6, interval: 1.8 }] },
+    // W2: more scouts
+    { groups: [{ type: 'scoutDrone', count: 10, interval: 1.2 }] },
+    // W3: scouts + fast strafers from multiple sides
+    { groups: [{ type: 'scoutDrone', count: 8, interval: 1.5 }, { type: 'fastDrone', count: 4, interval: 2.5 }] },
+    // W4: fast drone swarm — need spread fire
+    { groups: [{ type: 'fastDrone', count: 12, interval: 0.8 }] },
+    // W5: bombers appear — need focus fire on these
+    { groups: [{ type: 'scoutDrone', count: 8, interval: 1.2 }, { type: 'bomber', count: 2, interval: 5.0 }] },
+    // W6: mixed
+    { groups: [{ type: 'fastDrone', count: 10, interval: 0.9 }, { type: 'bomber', count: 4, interval: 3.0 }] },
+    // W7: heavy drones
+    { groups: [{ type: 'heavyDrone', count: 3, interval: 4.0 }, { type: 'scoutDrone', count: 12, interval: 0.8 }] },
+    // W8: stealth + bombers — chaos
+    { groups: [{ type: 'stealthDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }] },
+    // W9: everything
+    { groups: [{ type: 'fastDrone', count: 15, interval: 0.5 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'bomber', count: 4, interval: 2.5 }] },
+    // W10: boss rush
+    { groups: [{ type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'stealthDrone', count: 6, interval: 2.0 }, { type: 'bomber', count: 6, interval: 2.0 }] },
+  ];
+}
+const WAVES = genWaves();
+
+function startWave(idx) {
+  G.wave = idx;
+  G.waveActive = true;
+  G.spawnQueues = [];
+  const w = WAVES[Math.min(idx, WAVES.length - 1)];
+  const scale = idx >= WAVES.length ? 1 + (idx - WAVES.length + 1) * 0.3 : 1;
+  for (const g of w.groups) {
+    G.spawnQueues.push({
+      type: g.type, remaining: Math.ceil(g.count * scale),
+      interval: g.interval / Math.sqrt(scale), timer: rand(0.2, 1.0),
+    });
+  }
+  G.announce = { text: `WAVE ${idx + 1}`, timer: 2.5 };
+  sfx('wave');
+}
+
+// ─── MAIN UPDATE ────────────────────────────────────────
+function update(dt) {
+  G.time += dt;
+  if (G.phase === 'title' || G.phase === 'gameover') return;
+  if (G.phase === 'building') {
+    updateScraps(dt);
+    updateParticles(dt); updateShake();
+    return;
+  }
+
+  // === PLAYING ===
+  updateSpawns(dt);
+  updateEnemyAI(dt);
+  updateTurretAiming(dt);
+  updateTurretFiring(dt);
+  updateBullets(dt);
+  updateTorpedoes(dt);
+  updateScraps(dt);
+  updateParticles(dt);
+  updateShake();
+  if (G.dmgFlash > 0) G.dmgFlash -= dt;
+
+  // Check ship death
+  if (G.ship.hp <= 0 && G.phase === 'playing') {
+    G.phase = 'gameover';
+    addShake(12);
+    sfx('explode');
+    emitP(G.ship.x, G.ship.y, 120, {
+      colors: ['#ff4444', '#ff8844', '#ffcc44', '#333', '#111'],
+      spdMin: 40, spdMax: 400, szMin: 3, szMax: 14,
+      lifeMin: 0.5, lifeMax: 2.5, type: 'debris',
+    });
+  }
+
+  // Check wave complete
+  if (G.waveActive) {
+    const allSpawned = G.spawnQueues.every(q => q.remaining <= 0);
+    if (allSpawned && G.enemies.length === 0 && G.torpedoes.length === 0) {
+      G.waveActive = false;
+      setTimeout(() => {
+        if (G.phase === 'playing') {
+          G.phase = 'building';
+          G.buildUI = { selectedType: null, selectedSlot: null, mode: 'main' };
+          notify('改修フェーズ — 砲台を設置・強化せよ');
+        }
+      }, 1200);
+    }
+  }
+}
+
+function updateSpawns(dt) {
+  for (const q of G.spawnQueues) {
+    if (q.remaining <= 0) continue;
+    q.timer -= dt;
+    if (q.timer <= 0) {
+      spawnEnemy(q.type);
+      q.remaining--;
+      q.timer = q.interval;
+    }
+  }
+}
+
+// ─── ENEMY AI: Realistic flight patterns ────────────────
+function updateEnemyAI(dt) {
+  const sx = G.ship.x, sy = G.ship.y;
+
+  for (let i = G.enemies.length - 1; i >= 0; i--) {
+    const e = G.enemies[i];
+    const spd = e.speed * e.slowFactor;
+
+    // Slow timer
+    if (e.slowTimer > 0) { e.slowTimer -= dt; if (e.slowTimer <= 0) e.slowFactor = 1.0; }
+    if (e.hitFlash > 0) e.hitFlash -= dt * 5;
+
+    // Stealth
+    if (e.stealth) {
+      const d = dist(e.x, e.y, sx, sy);
+      e.stealthAlpha = d < 200 ? lerp(0.15, 1.0, 1 - d / 200) : 0.15;
+    }
+
+    const dToShip = dist(e.x, e.y, sx, sy);
+
+    // State machine
+    switch (e.phase) {
+      case 'approach': {
+        // Fly toward orbit radius
+        const targetDist = e.behavior === 'orbit' ? e.orbitRadius + 40 : e.strafeOffset + 80;
+        if (dToShip > targetDist) {
+          // Fly toward ship
+          const toShip = ang(e.x, e.y, sx, sy);
+          e.angle = shortAngle(e.angle, toShip, 3.0 * dt);
+          e.x += Math.cos(e.angle) * spd * dt;
+          e.y += Math.sin(e.angle) * spd * dt;
+        } else {
+          // Arrived — transition
+          if (e.behavior === 'orbit') {
+            e.phase = 'orbit';
+            e.orbitAngle = ang(sx, sy, e.x, e.y);
+          } else {
+            e.phase = 'strafe';
+            // Pick a strafe line across the ship
+            const crossAngle = ang(e.x, e.y, sx, sy) + rand(-0.3, 0.3);
+            e.angle = crossAngle;
+            e.strafeTarget = {
+              x: sx + Math.cos(crossAngle) * 600,
+              y: sy + Math.sin(crossAngle) * 600,
+            };
+          }
+        }
+        break;
+      }
+
+      case 'orbit': {
+        // Circle around the ship
+        const orbitSpd = (spd / e.orbitRadius) * e.orbitDir;
+        e.orbitAngle += orbitSpd * dt;
+        const tx = sx + Math.cos(e.orbitAngle) * e.orbitRadius;
+        const ty = sy + Math.sin(e.orbitAngle) * e.orbitRadius;
+        const toTarget = ang(e.x, e.y, tx, ty);
+        e.angle = shortAngle(e.angle, toTarget, 4.0 * dt);
+        e.x += Math.cos(e.angle) * spd * dt;
+        e.y += Math.sin(e.angle) * spd * dt;
+
+        e.phaseTimer += dt;
+        const orbitPeriod = (TAU * e.orbitRadius) / spd;
+        if (e.phaseTimer >= orbitPeriod) {
+          e.orbitsRemaining--;
+          e.phaseTimer = 0;
+          if (e.orbitsRemaining <= 0) {
+            e.phase = 'attack';
+            e.torpedoReady = true;
+          }
+        }
+        break;
+      }
+
+      case 'strafe': {
+        // Fly across the ship in a line
+        if (e.strafeTarget) {
+          const toT = ang(e.x, e.y, e.strafeTarget.x, e.strafeTarget.y);
+          e.angle = shortAngle(e.angle, toT, 3.0 * dt);
+        }
+        e.x += Math.cos(e.angle) * spd * 1.3 * dt;
+        e.y += Math.sin(e.angle) * spd * 1.3 * dt;
+
+        // Drop torpedo when passing close to ship
+        if (!e.torpedoDropped && dToShip < e.strafeOffset + 50) {
+          dropTorpedo(e);
+        }
+
+        // After passing through, retreat
+        if (dToShip > 500 && e.torpedoDropped) {
+          // Circle back for another pass
+          e.phase = 'approach';
+          e.torpedoDropped = false;
+        } else if (dist(e.x, e.y, e.strafeTarget?.x || 0, e.strafeTarget?.y || 0) < 60) {
+          e.phase = 'retreat';
+          e.retreatAngle = e.angle;
+          e.phaseTimer = 0;
+        }
+        break;
+      }
+
+      case 'attack': {
+        // Dive toward ship to drop torpedo
+        const toShip = ang(e.x, e.y, sx, sy);
+        e.angle = shortAngle(e.angle, toShip, 3.0 * dt);
+        e.x += Math.cos(e.angle) * spd * 1.5 * dt;
+        e.y += Math.sin(e.angle) * spd * 1.5 * dt;
+
+        if (dToShip < 80 && e.torpedoReady && !e.torpedoDropped) {
+          dropTorpedo(e);
+          e.torpedoReady = false;
+        }
+
+        // After dropping or getting close, retreat
+        if (e.torpedoDropped || dToShip < 40) {
+          e.phase = 'retreat';
+          e.retreatAngle = ang(sx, sy, e.x, e.y); // away from ship
+          e.phaseTimer = 0;
+        }
+        break;
+      }
+
+      case 'retreat': {
+        // Fly away then loop back
+        e.angle = shortAngle(e.angle, e.retreatAngle, 2.5 * dt);
+        e.x += Math.cos(e.angle) * spd * dt;
+        e.y += Math.sin(e.angle) * spd * dt;
+        e.phaseTimer += dt;
+
+        if (e.phaseTimer > 3.0 || dToShip > 600) {
+          // Come back for another pass
+          e.phase = 'approach';
+          e.orbitsRemaining = 1;
+          e.torpedoDropped = false;
+          e.torpedoReady = false;
+          e.phaseTimer = 0;
+        }
+        break;
+      }
+    }
+
+    // Remove if dead
+    if (e.hp <= 0) {
+      G.score += e.score; G.kills++;
+      emitP(e.x, e.y, 35, {
+        colors: ['#ff6644', '#ffaa44', '#ffdd66', '#444', '#666'],
+        spdMin: 50, spdMax: 220, szMin: 2, szMax: 9,
+        lifeMin: 0.3, lifeMax: 1.4, type: 'debris',
+      });
+      emitP(e.x, e.y, 15, {
+        colors: ['#ffcc44', '#fff'],
+        spdMin: 100, spdMax: 350, szMin: 1, szMax: 3,
+        lifeMin: 0.1, lifeMax: 0.4, type: 'spark',
+      });
+      sfx('explode'); addShake(3);
+      spawnScrap(e.x, e.y, e.drop);
+      G.enemies.splice(i, 1);
+    }
+  }
+}
+
+// ─── TURRET AIMING (pointer-driven) ─────────────────────
+function updateTurretAiming(dt) {
+  const ship = G.ship;
+  const activePointers = [...pointers.values()];
+
+  // Collect world positions of pointers
+  const ptrWorld = activePointers.map(p => screenToWorld(p.x, p.y));
+
+  // Collect active turrets with world positions
+  const turretInfos = [];
+  for (const slot of ship.slots) {
+    if (!slot.turret || slot.turret.buildAnim > 0) continue;
+    const wx = ship.x + slot.rx;
+    const wy = ship.y + slot.ry;
+    turretInfos.push({ slot, turret: slot.turret, wx, wy, def: TURRET_DEFS[slot.turret.type] });
+  }
+  if (turretInfos.length === 0) return;
+
+  if (ptrWorld.length === 0) {
+    // No input — turrets hold their current angle (no auto-aim)
+    return;
+  }
+
+  // Assign pointers to turrets
+  // Rule: each pointer claims the closest turrets that can aim at it.
+  // If more turrets than pointers, excess turrets aim at nearest pointer.
+  // If more pointers than turrets, turrets aim at earliest (first) pointer.
+
+  // For each turret, check which pointers are within its arc
+  // Then assign greedily: earliest pointer first
+
+  // Simple approach: sort pointers by startTime (earliest first)
+  const sortedPtrs = [...activePointers].sort((a, b) => a.startTime - b.startTime);
+  const sortedPtrWorld = sortedPtrs.map(p => screenToWorld(p.x, p.y));
+
+  // Track which turrets have been assigned
+  const assigned = new Set();
+
+  for (let pi = 0; pi < sortedPtrWorld.length; pi++) {
+    const pw = sortedPtrWorld[pi];
+
+    // Find closest unassigned turrets that can aim at this pointer
+    const candidates = turretInfos
+      .filter(t => !assigned.has(t.slot.id))
+      .map(t => {
+        const wantAngle = ang(t.wx, t.wy, pw.x, pw.y);
+        const arcDiff = Math.abs(angleDiff(t.slot.baseFacing, wantAngle));
+        const inArc = arcDiff <= t.def.arcLimit;
+        const d = dist(t.wx, t.wy, pw.x, pw.y);
+        return { ...t, wantAngle, inArc, d };
+      })
+      .filter(t => t.inArc)
+      .sort((a, b) => a.d - b.d);
+
+    if (candidates.length === 0) continue;
+
+    // If this is the only pointer, all reachable turrets aim here
+    if (sortedPtrWorld.length === 1) {
+      for (const c of candidates) {
+        c.turret.targetAngle = c.wantAngle;
+        assigned.add(c.slot.id);
+      }
+    } else {
+      // Multi-pointer: assign closest turret(s) to this pointer
+      // Assign at least one; try to split evenly
+      const share = Math.max(1, Math.ceil(turretInfos.length / sortedPtrWorld.length));
+      let count = 0;
+      for (const c of candidates) {
+        if (count >= share) break;
+        c.turret.targetAngle = c.wantAngle;
+        assigned.add(c.slot.id);
+        count++;
+      }
+    }
+  }
+
+  // Unassigned turrets: aim at nearest pointer within arc
+  for (const t of turretInfos) {
+    if (assigned.has(t.slot.id)) continue;
+    let best = null, bestD = Infinity;
+    for (const pw of sortedPtrWorld) {
+      const wa = ang(t.wx, t.wy, pw.x, pw.y);
+      const arcDiff = Math.abs(angleDiff(t.slot.baseFacing, wa));
+      if (arcDiff > t.def.arcLimit) continue;
+      const d = dist(t.wx, t.wy, pw.x, pw.y);
+      if (d < bestD) { bestD = d; best = wa; }
+    }
+    if (best !== null) t.turret.targetAngle = best;
+    // Otherwise hold current angle
+  }
+
+  // Rotate turrets toward target angle (slow rotation!)
+  for (const t of turretInfos) {
+    const rotSpeed = t.def.rotSpeed * 60; // per-second
+    // Clamp target within arc
+    const arcDiff = angleDiff(t.slot.baseFacing, t.turret.targetAngle);
+    const clampedTarget = t.slot.baseFacing + clamp(arcDiff, -t.def.arcLimit, t.def.arcLimit);
+    t.turret.targetAngle = clampedTarget;
+
+    t.turret.angle = shortAngle(t.turret.angle, t.turret.targetAngle, rotSpeed * dt);
+
+    // Recoil recovery
+    if (t.turret.recoil > 0) t.turret.recoil -= dt * 10;
+  }
+}
+
+// ─── TURRET FIRING ──────────────────────────────────────
+function updateTurretFiring(dt) {
+  const ship = G.ship;
+  const activePointers = [...pointers.values()];
+  const hasTouchInput = activePointers.length > 0;
+
+  for (const slot of ship.slots) {
+    const t = slot.turret;
+    if (!t || t.buildAnim > 0) {
+      if (t) { t.buildAnim -= dt * 2; if (t.buildAnim < 0) t.buildAnim = 0; }
+      continue;
+    }
+    const def = TURRET_DEFS[t.type];
+    const lv = t.level;
+    const wx = ship.x + slot.rx;
+    const wy = ship.y + slot.ry;
+
+    t.cooldown -= dt;
+    t.burstTimer -= dt;
+
+    // Only fire if pointer is active (player is aiming)
+    if (!hasTouchInput) continue;
+
+    // Check if any enemy is in the direction we're actually facing and in range
+    const range = turretStat(def, lv, 'range');
+    const dmg = turretStat(def, lv, 'damage');
+    const cd = turretStat(def, lv, 'burstCooldown');
+
+    // Find a target in the direction we're aiming (within a cone)
+    let targetInCone = false;
+    for (const e of G.enemies) {
+      if (e.stealth && e.stealthAlpha < 0.4) continue;
+      const d = dist(wx, wy, e.x, e.y);
+      if (d > range) continue;
+      const toEnemy = ang(wx, wy, e.x, e.y);
+      const diff = Math.abs(angleDiff(t.angle, toEnemy));
+      if (diff < 20 * DEG) { targetInCone = true; break; }
+    }
+
+    // Jammer: AoE slow
+    if (t.type === 'jammer') {
+      if (t.cooldown <= 0 && hasTouchInput) {
+        let hit = false;
+        for (const e of G.enemies) {
+          const d = dist(wx, wy, e.x, e.y);
+          if (d < range) {
+            e.slowFactor = def.slowFactor;
+            e.slowTimer = def.slowDuration;
+            hit = true;
+          }
+        }
+        if (hit) {
+          emitP(wx, wy, 10, {
+            colors: ['#b088ff', '#8866dd'],
+            spdMin: 80, spdMax: 200, szMin: 2, szMax: 4,
+            lifeMin: 0.3, lifeMax: 0.6, gravity: 0,
+          });
+          // Pulse ring
+          emitP(wx, wy, 1, {
+            color: '#b088ff', spdMin: 0, spdMax: 0,
+            szMin: range * 0.8, szMax: range, lifeMin: 0.5, lifeMax: 0.5,
+            type: 'ring', gravity: 0,
+          });
+          sfx('jammer');
+        }
+        t.cooldown = cd;
+      }
+      continue;
+    }
+
+    // Only fire when aiming close enough to an enemy
+    if (!targetInCone) continue;
+
+    // Burst fire
+    if (t.cooldown <= 0) {
+      if (t.burstCount < def.burstSize) {
+        if (t.burstTimer <= 0) {
+          const a = t.angle + rand(-def.spread, def.spread);
+          t.recoil = 1.0;
+
+          if (def.homing) {
+            // Find closest enemy for homing
+            let closest = null, cd2 = Infinity;
+            for (const e of G.enemies) {
+              const d = dist(wx, wy, e.x, e.y);
+              if (d < range && d < cd2) { cd2 = d; closest = e; }
+            }
+            spawnBullet(wx, wy, a, def.bulletSpeed, dmg, def.tracerCol, { homing: true, target: closest });
+            sfx('missile');
+          } else {
+            spawnBullet(wx, wy, a, def.bulletSpeed, dmg, def.tracerCol, { aoe: def.aoe || 0 });
+            emitP(wx + Math.cos(a) * 12, wy + Math.sin(a) * 12, 3, {
+              angle: a, spread: 0.3,
+              colors: ['#ffdd44', '#ffaa22', '#fff'],
+              spdMin: 150, spdMax: 300, szMin: 1, szMax: 3,
+              lifeMin: 0.04, lifeMax: 0.1, type: 'spark', gravity: 0,
+            });
+            sfx(t.type === 'flak' ? 'flak' : 'mg');
+          }
+
+          t.burstCount++;
+          t.burstTimer = def.burstDelay;
+        }
+      } else {
+        t.burstCount = 0;
+        t.cooldown = cd;
+      }
+    }
+  }
+}
+
+// ─── BULLETS ────────────────────────────────────────────
+function updateBullets(dt) {
+  for (let i = G.bullets.length - 1; i >= 0; i--) {
+    const b = G.bullets[i];
+    if (b.homing && b.target && b.target.hp > 0) {
+      const ta = ang(b.x, b.y, b.target.x, b.target.y);
+      b.angle = shortAngle(b.angle, ta, 6 * dt);
+    }
+    b.x += Math.cos(b.angle) * b.speed * dt;
+    b.y += Math.sin(b.angle) * b.speed * dt;
+    b.life -= dt;
+    b.trail.push({ x: b.x, y: b.y });
+    if (b.trail.length > 8) b.trail.shift();
+
+    if (b.life <= 0) { G.bullets.splice(i, 1); continue; }
+
+    let hit = false;
+    for (const e of G.enemies) {
+      if (dist(b.x, b.y, e.x, e.y) < e.size + 4) {
+        e.hp -= b.damage;
+        e.hitFlash = 1.0;
+        hit = true;
+        emitP(b.x, b.y, 5, {
+          angle: b.angle + PI, spread: 0.8,
+          colors: ['#ffcc44', '#ff8844'], spdMin: 50, spdMax: 150,
+          szMin: 1, szMax: 3, lifeMin: 0.08, lifeMax: 0.25, type: 'spark', gravity: 0,
+        });
+        if (b.aoe > 0) {
+          for (const e2 of G.enemies) {
+            if (e2 === e) continue;
+            const d2 = dist(b.x, b.y, e2.x, e2.y);
+            if (d2 < b.aoe) { e2.hp -= b.damage * (1 - d2 / b.aoe) * 0.5; e2.hitFlash = 0.5; }
+          }
+          emitP(b.x, b.y, 20, {
+            colors: ['#ff6644', '#ffaa44', '#ffdd66'],
+            spdMin: 40, spdMax: 120, szMin: 3, szMax: 8,
+            lifeMin: 0.2, lifeMax: 0.5, gravity: 0,
+          });
+          addShake(2); sfx('explode');
+        }
+        break;
+      }
+    }
+    if (hit) G.bullets.splice(i, 1);
+  }
+}
+
+// ─── TORPEDOES ──────────────────────────────────────────
+function updateTorpedoes(dt) {
+  for (let i = G.torpedoes.length - 1; i >= 0; i--) {
+    const t = G.torpedoes[i];
+    const a = ang(t.x, t.y, t.tx, t.ty);
+    t.x += Math.cos(a) * t.speed * dt;
+    t.y += Math.sin(a) * t.speed * dt;
+    t.life -= dt;
+    t.trail.push({ x: t.x, y: t.y });
+    if (t.trail.length > 12) t.trail.shift();
+
+    const d = dist(t.x, t.y, t.tx, t.ty);
+    if (d < 20 || t.life <= 0) {
+      // Impact!
+      if (d < 80) {
+        G.ship.hp -= t.damage;
+        G.dmgFlash = 0.4;
+        addShake(6);
+        sfx('hit');
+        emitP(t.x, t.y, 30, {
+          colors: ['#ff4444', '#ff8844', '#ffcc44', '#4488ff'],
+          spdMin: 80, spdMax: 280, szMin: 2, szMax: 8,
+          lifeMin: 0.3, lifeMax: 1.0, type: 'circle', gravity: 0,
+        });
+        // Water splash
+        emitP(t.x, t.y, 15, {
+          colors: ['#4488cc', '#66aaee', '#88ccff'],
+          spdMin: 60, spdMax: 200, szMin: 2, szMax: 6,
+          lifeMin: 0.2, lifeMax: 0.6, type: 'circle',
+        });
+      }
+      G.torpedoes.splice(i, 1);
+    }
+  }
+}
+
+// ─── SCRAPS (auto-collect) ──────────────────────────────
+function updateScraps(dt) {
+  for (let i = G.scraps.length - 1; i >= 0; i--) {
+    const s = G.scraps[i];
+    s.life -= dt;
+    s.rot += s.rotSpd * dt;
+    if (s.life <= 0) { G.scraps.splice(i, 1); continue; }
+
+    // Always pull toward ship (auto-collect)
+    const d = dist(s.x, s.y, G.ship.x, G.ship.y);
+    const a = ang(s.x, s.y, G.ship.x, G.ship.y);
+    // Gentle pull that increases as scrap ages (so it gets collected)
+    const age = 20 - s.life; // 0 at spawn, 20 at max age
+    const pull = 150 + age * 40 + (d < 120 ? (120 - d) * 8 : 0);
+    s.vx += Math.cos(a) * pull * dt;
+    s.vy += Math.sin(a) * pull * dt;
+    s.vx *= 0.95; s.vy *= 0.95;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+
+    if (d < 30) {
+      G.res[s.type] = (G.res[s.type] || 0) + s.value;
+      G.scraps.splice(i, 1);
+      sfx('pickup');
+    }
+  }
+}
+
+// ─── NOTIFICATIONS ──────────────────────────────────────
+function notify(text) { G.notifications.push({ text, timer: 3.5 }); }
+
+// ─── RENDER ─────────────────────────────────────────────
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  if (G.phase === 'title') { renderTitle(); return; }
+
+  ctx.save();
+  ctx.translate(CX - G.ship.x + shakeOx, CY - G.ship.y + shakeOy);
+
+  renderOcean();
+  renderScraps();
+  renderTorpedoes();
+  renderShip();
+  renderEnemies();
+  renderBullets();
+  drawParticles();
+
+  // Turret range indicators when pointer is active
+  if (pointers.size > 0) {
+    for (const slot of G.ship.slots) {
+      if (!slot.turret || slot.turret.buildAnim > 0) continue;
+      const def = TURRET_DEFS[slot.turret.type];
+      const wx = G.ship.x + slot.rx;
+      const wy = G.ship.y + slot.ry;
+      const range = turretStat(def, slot.turret.level, 'range');
+      // Arc indicator
+      const arcStart = slot.baseFacing - def.arcLimit;
+      const arcEnd = slot.baseFacing + def.arcLimit;
+      ctx.strokeStyle = `rgba(74,240,192,0.08)`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(wx, wy, range, arcStart, arcEnd);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+
+  // Overlays
+  if (G.dmgFlash > 0) {
+    ctx.fillStyle = `rgba(255,40,40,${G.dmgFlash * 0.3})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+  renderHUD();
+  if (G.phase === 'building') renderBuildUI();
+  if (G.phase === 'gameover') renderGameOver();
+  renderAnnounce();
+  renderNotifs();
+  renderDebug();
+}
+
+function renderOcean() {
+  const l = G.ship.x - CX - 80, t2 = G.ship.y - CY - 80;
+  const r = G.ship.x + CX + 80, b = G.ship.y + CY + 80;
+  ctx.fillStyle = '#0a1628';
+  ctx.fillRect(l, t2, r - l, b - t2);
+  // Waves
+  const time = G.time;
+  ctx.strokeStyle = 'rgba(120,180,255,0.06)';
+  ctx.lineWidth = 1;
+  const gs = 50;
+  const sx = Math.floor(l / gs) * gs;
+  for (let y = Math.floor(t2 / gs) * gs; y < b; y += gs) {
+    ctx.beginPath();
+    for (let x = sx; x < r; x += 4) {
+      const w = Math.sin(x * 0.018 + time * 0.7) * 5 + Math.sin(x * 0.008 + y * 0.005 + time * 0.4) * 7;
+      x === sx ? ctx.moveTo(x, y + w) : ctx.lineTo(x, y + w);
+    }
+    ctx.stroke();
+  }
+  // Grid
+  ctx.strokeStyle = 'rgba(60,100,160,0.04)';
+  ctx.lineWidth = 0.5;
+  for (let x = sx; x < r; x += gs * 3) { ctx.beginPath(); ctx.moveTo(x, t2); ctx.lineTo(x, b); ctx.stroke(); }
+  for (let y = Math.floor(t2 / gs) * gs; y < b; y += gs * 3) { ctx.beginPath(); ctx.moveTo(l, y); ctx.lineTo(r, y); ctx.stroke(); }
+}
+
+function renderShip() {
+  const s = G.ship;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+
+  // Wake
+  ctx.fillStyle = 'rgba(150,200,255,0.025)';
+  for (let i = 0; i < 5; i++) {
+    const off = -i * 22 - 60, sp = 10 + i * 6;
+    ctx.beginPath(); ctx.moveTo(off, 0); ctx.lineTo(off - 28, -sp); ctx.lineTo(off - 28, sp); ctx.closePath(); ctx.fill();
+  }
+
+  // Hull shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); shipPath(ctx, 3, 3, s.w, s.h); ctx.fill();
+  // Hull
+  const hg = ctx.createLinearGradient(0, -s.h / 2, 0, s.h / 2);
+  hg.addColorStop(0, '#4a5a6e'); hg.addColorStop(0.5, '#3a4a5c'); hg.addColorStop(1, '#2a3a4c');
+  ctx.fillStyle = hg;
+  ctx.beginPath(); shipPath(ctx, 0, 0, s.w, s.h); ctx.fill();
+  ctx.strokeStyle = 'rgba(100,140,180,0.25)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); shipPath(ctx, 0, 0, s.w, s.h); ctx.stroke();
+
+  // Deck
+  ctx.fillStyle = 'rgba(80,100,120,0.4)'; ctx.fillRect(-22, -8, 50, 16);
+  ctx.fillStyle = '#5a6a7e'; ctx.fillRect(-10, -6, 20, 12);
+  ctx.fillStyle = '#6a7a8e'; ctx.fillRect(-8, -5, 16, 10);
+
+  // Reactor pulse
+  const rp = 0.5 + Math.sin(G.time * 3) * 0.2;
+  ctx.fillStyle = `rgba(74,240,192,${rp * 0.25})`; ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU); ctx.fill();
+  ctx.fillStyle = `rgba(74,240,192,${rp * 0.5})`; ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.fill();
+
+  // Turrets
+  for (const slot of s.slots) {
+    if (!slot.turret) {
+      // Empty slot
+      ctx.fillStyle = 'rgba(100,150,200,0.12)';
+      ctx.beginPath(); ctx.arc(slot.rx, slot.ry, 7, 0, TAU); ctx.fill();
+      ctx.strokeStyle = 'rgba(100,150,200,0.25)'; ctx.lineWidth = 1; ctx.stroke();
+      // + icon
+      ctx.strokeStyle = 'rgba(100,150,200,0.35)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(slot.rx - 3, slot.ry); ctx.lineTo(slot.rx + 3, slot.ry); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(slot.rx, slot.ry - 3); ctx.lineTo(slot.rx, slot.ry + 3); ctx.stroke();
+      continue;
+    }
+    renderTurret(slot);
+  }
+  ctx.restore();
+
+  // Ship HP bar
+  const bw = 90, bh = 5, bx = s.x - bw / 2, by = s.y - s.h / 2 - 18;
+  const hp = clamp(s.hp / s.maxHp, 0, 1);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)'; rr(ctx, bx, by, bw, bh, 2); ctx.fill();
+  ctx.fillStyle = hp > 0.5 ? '#44ee88' : hp > 0.25 ? '#ffaa22' : '#ff4466';
+  rr(ctx, bx, by, bw * hp, bh, 2); ctx.fill();
+}
+
+function shipPath(c, ox, oy, w, h) {
+  const hw = w / 2, hh = h / 2;
+  c.moveTo(ox + hw + 15, oy);
+  c.quadraticCurveTo(ox + hw, oy - hh * 0.8, ox + hw * 0.3, oy - hh);
+  c.lineTo(ox - hw * 0.7, oy - hh);
+  c.quadraticCurveTo(ox - hw - 5, oy - hh * 0.5, ox - hw - 5, oy);
+  c.quadraticCurveTo(ox - hw - 5, oy + hh * 0.5, ox - hw * 0.7, oy + hh);
+  c.lineTo(ox + hw * 0.3, oy + hh);
+  c.quadraticCurveTo(ox + hw, oy + hh * 0.8, ox + hw + 15, oy);
+}
+
+function renderTurret(slot) {
+  const t = slot.turret;
+  const def = TURRET_DEFS[t.type];
+  ctx.save();
+  ctx.translate(slot.rx, slot.ry);
+
+  if (t.buildAnim > 0) {
+    ctx.globalAlpha = 1 - t.buildAnim;
+    ctx.scale(1 - t.buildAnim * 0.3, 1 - t.buildAnim * 0.3);
+  }
+
+  // Base
+  const bs = t.type === 'jammer' ? 7 : t.type === 'launcher' ? 8 : 6;
+  ctx.fillStyle = '#445566'; ctx.beginPath(); ctx.arc(0, 0, bs, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(100,140,180,0.35)'; ctx.lineWidth = 1; ctx.stroke();
+
+  // Level pips
+  if (t.level > 1) {
+    for (let i = 0; i < Math.min(t.level - 1, 5); i++) {
+      const pa = -PI / 2 + (i - (Math.min(t.level - 1, 5) - 1) / 2) * 0.5;
+      ctx.fillStyle = '#4af0c0';
+      ctx.beginPath();
+      ctx.arc(Math.cos(pa) * (bs + 3), Math.sin(pa) * (bs + 3), 1.5, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  ctx.rotate(t.angle);
+
+  if (t.type === 'jammer') {
+    ctx.strokeStyle = '#8866cc'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, 10, -0.8, 0.8); ctx.stroke();
+    ctx.strokeStyle = '#aa88ee'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(12, 0); ctx.stroke();
+    const pulse = (Math.sin(G.time * 4) + 1) * 0.5;
+    ctx.fillStyle = `rgba(176,136,255,${pulse * 0.25})`;
+    ctx.beginPath(); ctx.arc(0, 0, 14, 0, TAU); ctx.fill();
+  } else if (t.type === 'launcher') {
+    ctx.fillStyle = '#556677'; ctx.fillRect(-4, -5, 14, 10);
+    for (let j = -2; j <= 2; j += 2) { ctx.fillStyle = '#334455'; ctx.fillRect(2, j - 1, 8, 2); }
+  } else {
+    const blen = t.type === 'flak' ? 14 : 10;
+    const bw2 = t.type === 'flak' ? 2.5 : 1.5;
+    const rc = t.recoil * 3;
+    if (def.barrels >= 2) {
+      for (const yo of [-2.5, 2.5]) { ctx.fillStyle = '#889aab'; ctx.fillRect(-rc, yo - bw2 / 2, blen, bw2); }
+    } else {
+      ctx.fillStyle = '#889aab'; ctx.fillRect(-rc, -bw2 / 2, blen, bw2);
+    }
+    if (t.recoil > 0.6) {
+      ctx.fillStyle = `rgba(255,220,68,${(t.recoil - 0.6) * 2.5})`;
+      ctx.beginPath(); ctx.arc(blen - rc + 2, 0, 4, 0, TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function renderEnemies() {
+  for (const e of G.enemies) {
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.rotate(e.angle);
+    if (e.stealth) ctx.globalAlpha = e.stealthAlpha;
+    if (e.hitFlash > 0) ctx.globalAlpha = Math.max(ctx.globalAlpha, 0.8);
+
+    const sz = e.size;
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.beginPath(); ctx.ellipse(2, 2, sz * 1.2, sz * 0.6, 0, 0, TAU); ctx.fill();
+
+    const col = e.hitFlash > 0 ? '#ffffff' : e.color;
+    ctx.fillStyle = col;
+
+    if (e.type === 'bomber' || e.type === 'heavyDrone') {
+      ctx.beginPath();
+      ctx.moveTo(sz, 0); ctx.lineTo(-sz * 0.5, -sz * 0.8);
+      ctx.lineTo(-sz, 0); ctx.lineTo(-sz * 0.5, sz * 0.8); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = e.hitFlash > 0 ? '#ddd' : `${e.color}88`;
+      ctx.fillRect(-sz * 0.3, -sz * 1.2, sz * 0.6, sz * 0.4);
+      ctx.fillRect(-sz * 0.3, sz * 0.8, sz * 0.6, sz * 0.4);
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(sz, 0); ctx.lineTo(0, -sz * 0.6);
+      ctx.lineTo(-sz * 0.7, 0); ctx.lineTo(0, sz * 0.6); ctx.closePath(); ctx.fill();
+      // Propeller
+      const pa = G.time * 20;
+      ctx.strokeStyle = e.hitFlash > 0 ? '#ccc' : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 0.5;
+      for (const py of [-sz * 0.5, sz * 0.5]) {
+        ctx.beginPath(); ctx.arc(-sz * 0.2, py, sz * 0.3, pa, pa + PI); ctx.stroke();
+      }
+    }
+
+    // Torpedo ready indicator (pulsing red)
+    if (e.phase === 'attack' || (e.phase === 'orbit' && e.orbitsRemaining <= 1)) {
+      const pulse = (Math.sin(G.time * 8) + 1) * 0.5;
+      ctx.fillStyle = `rgba(255,68,68,${0.3 + pulse * 0.4})`;
+      ctx.beginPath(); ctx.arc(0, 0, sz + 5, 0, TAU); ctx.fill();
+      // Warning icon
+      ctx.fillStyle = '#ff4444';
+      ctx.font = `bold ${sz}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('!', 0, -sz - 6);
+    }
+
+    // Slow ring
+    if (e.slowTimer > 0) {
+      ctx.strokeStyle = 'rgba(176,136,255,0.5)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(0, 0, sz + 4, 0, TAU * (e.slowTimer / 3)); ctx.stroke();
+    }
+
+    // Engine
+    ctx.fillStyle = e.stealth ? 'rgba(100,100,200,0.3)' : 'rgba(255,100,50,0.5)';
+    ctx.beginPath(); ctx.arc(-sz * 0.6, 0, sz * 0.2 + Math.sin(G.time * 15), 0, TAU); ctx.fill();
+
+    ctx.restore();
+
+    // HP bar for tough enemies
+    if (e.maxHp > 50 && e.hp < e.maxHp) {
+      const bw = e.size * 2, bh = 2;
+      ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(e.x - bw / 2, e.y - e.size - 6, bw, bh);
+      ctx.fillStyle = '#ff4466'; ctx.fillRect(e.x - bw / 2, e.y - e.size - 6, bw * (e.hp / e.maxHp), bh);
+    }
+  }
+}
+
+function renderBullets() {
+  for (const b of G.bullets) {
+    ctx.save();
+    if (b.trail.length > 1) {
+      ctx.strokeStyle = b.color; ctx.lineWidth = b.homing ? 2 : 1; ctx.globalAlpha = 0.35;
+      ctx.beginPath(); ctx.moveTo(b.trail[0].x, b.trail[0].y);
+      for (let j = 1; j < b.trail.length; j++) ctx.lineTo(b.trail[j].x, b.trail[j].y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    if (b.homing) {
+      ctx.translate(b.x, b.y); ctx.rotate(b.angle);
+      ctx.fillStyle = '#ccddee'; ctx.fillRect(-5, -1.5, 10, 3);
+      ctx.fillStyle = '#ff4466'; ctx.fillRect(-5, -1, 3, 2);
+      ctx.fillStyle = `rgba(255,150,50,${0.5 + Math.random() * 0.5})`;
+      ctx.beginPath(); ctx.arc(-7, 0, 2, 0, TAU); ctx.fill();
+    } else if (b.aoe > 0) {
+      ctx.fillStyle = b.color; ctx.beginPath(); ctx.arc(b.x, b.y, 3, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(255,120,50,0.25)'; ctx.beginPath(); ctx.arc(b.x, b.y, 6, 0, TAU); ctx.fill();
+    } else {
+      ctx.fillStyle = b.color; ctx.beginPath(); ctx.arc(b.x, b.y, 1.5, 0, TAU); ctx.fill();
+      ctx.fillStyle = `${b.color}44`; ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function renderTorpedoes() {
+  for (const t of G.torpedoes) {
+    // Trail
+    ctx.strokeStyle = 'rgba(255,100,50,0.25)'; ctx.lineWidth = 2;
+    if (t.trail.length > 1) {
+      ctx.beginPath(); ctx.moveTo(t.trail[0].x, t.trail[0].y);
+      for (let j = 1; j < t.trail.length; j++) ctx.lineTo(t.trail[j].x, t.trail[j].y);
+      ctx.stroke();
+    }
+    // Body
+    const a = ang(t.x, t.y, t.tx, t.ty);
+    ctx.save(); ctx.translate(t.x, t.y); ctx.rotate(a);
+    ctx.fillStyle = '#ff6644'; ctx.fillRect(-6, -2, 12, 4);
+    ctx.fillStyle = '#ffaa44'; ctx.beginPath(); ctx.arc(-6, 0, 3, 0, TAU); ctx.fill();
+    ctx.restore();
+    // Target reticle
+    const pulse = (Math.sin(G.time * 6) + 1) * 0.5;
+    ctx.strokeStyle = `rgba(255,68,68,${0.2 + pulse * 0.3})`; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(t.tx, t.ty, 15 + pulse * 5, 0, TAU); ctx.stroke();
+  }
+}
+
+function renderScraps() {
+  for (const s of G.scraps) {
+    const alpha = s.life < 3 ? s.life / 3 : 1;
+    const col = RES_COL[s.type] || '#fff';
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(s.x, s.y); ctx.rotate(s.rot);
+    ctx.fillStyle = `${col}33`; ctx.beginPath(); ctx.arc(0, 0, s.size + 3, 0, TAU); ctx.fill();
+    ctx.fillStyle = col; ctx.fillRect(-s.size / 2, -s.size / 2, s.size, s.size);
+    ctx.restore();
+  }
+}
+
+function renderHUD() {
+  if (G.phase === 'title' || G.phase === 'gameover') return;
+  ctx.save();
+  const mobile = W < 600;
+  // Top bar
+  ctx.fillStyle = 'rgba(10,14,20,0.85)'; ctx.fillRect(0, 0, W, mobile ? 68 : 48);
+  ctx.fillStyle = 'rgba(100,150,200,0.08)'; ctx.fillRect(0, mobile ? 67 : 47, W, 1);
+
+  ctx.font = `700 ${mobile ? 13 : 15}px 'Cabinet Grotesk',sans-serif`; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(`WAVE ${G.wave + 1}`, 14, mobile ? 16 : 24);
+
+  ctx.font = `500 ${mobile ? 11 : 13}px 'Satoshi',sans-serif`; ctx.fillStyle = '#aabbcc';
+  ctx.fillText(`SCORE: ${G.score}`, mobile ? 100 : 110, mobile ? 16 : 24);
+
+  if (G.waveActive) {
+    ctx.fillStyle = '#ff6666';
+    ctx.fillText(`敵: ${G.enemies.length}`, mobile ? 195 : 240, mobile ? 16 : 24);
+    const tCount = G.torpedoes.length;
+    if (tCount > 0) {
+      ctx.fillStyle = '#ff4444';
+      ctx.fillText(`⚠ 魚雷: ${tCount}`, mobile ? 240 : 310, mobile ? 16 : 24);
+    }
+  }
+
+  // Resources — second row on mobile
+  const resY = mobile ? 48 : 24;
+  const RES_SHORT = { iron: '鉄', gunpowder: '火', electronics: '電', brass: '真' };
+  ctx.textAlign = 'right'; ctx.font = `600 ${mobile ? 10 : 12}px 'Satoshi',sans-serif`;
+  let rx = W - 10;
+  for (const key of ['brass', 'electronics', 'gunpowder', 'iron']) {
+    const v = G.res[key] || 0;
+    const label = mobile ? RES_SHORT[key] : RES_NAME[key];
+    const text = `${label}: ${v}`;
+    const tw = ctx.measureText(text).width;
+    ctx.fillStyle = RES_COL[key]; ctx.fillRect(rx - tw - 10, resY - 3, 6, 6);
+    ctx.fillStyle = '#ccddee'; ctx.fillText(text, rx, resY);
+    rx -= tw + (mobile ? 18 : 28);
+  }
+
+  // HP bar
+  const bw = Math.min(200, W - 60), bh = 8, bx = CX - bw / 2, by = H - 28;
+  const hp = clamp(G.ship.hp / G.ship.maxHp, 0, 1);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; rr(ctx, bx - 2, by - 2, bw + 4, bh + 4, 4); ctx.fill();
+  ctx.fillStyle = '#1a2233'; rr(ctx, bx, by, bw, bh, 3); ctx.fill();
+  ctx.fillStyle = hp > 0.5 ? '#44ee88' : hp > 0.25 ? '#ffaa22' : '#ff4466';
+  rr(ctx, bx, by, bw * hp, bh, 3); ctx.fill();
+  ctx.font = "600 11px 'Satoshi',sans-serif"; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.fillText(`HP: ${Math.max(0, Math.ceil(G.ship.hp))} / ${G.ship.maxHp}`, CX, by + bh + 13);
+
+  // Aim hint
+  if (G.phase === 'playing' && pointers.size === 0 && G.waveActive) {
+    const pulse = 0.5 + Math.sin(G.time * 3) * 0.3;
+    ctx.globalAlpha = pulse;
+    ctx.font = `500 ${mobile ? 13 : 16}px 'Satoshi',sans-serif`;
+    ctx.fillStyle = '#4af0c0';
+    ctx.fillText(mobile ? 'タップして照準' : 'タップして照準 — 長押しで射撃', CX, H - 60);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+// ─── BUILD UI (redesigned — separate panel, not overlapping ship) ──
+function renderBuildUI() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,10,20,0.4)'; ctx.fillRect(0, 0, W, H);
+
+  if (G.buildUI.mode === 'main') renderBuildMain();
+  else if (G.buildUI.mode === 'slot') renderBuildSlot();
+
+  ctx.restore();
+
+  handleBuildClick();
+}
+
+function renderBuildMain() {
+  const mobile = W < 600;
+
+  if (mobile) {
+    renderBuildMobile();
+    return;
+  }
+
+  // Left panel: turret list. Right side: ship view with slots
+  const panelW = Math.min(340, W * 0.4);
+  const panelH = H - 80;
+  const panelX = 20, panelY = 60;
+
+  // Panel bg
+  ctx.fillStyle = 'rgba(15,20,35,0.95)';
+  rr(ctx, panelX, panelY, panelW, panelH, 12); ctx.fill();
+  ctx.strokeStyle = 'rgba(100,150,200,0.15)'; ctx.lineWidth = 1;
+  rr(ctx, panelX, panelY, panelW, panelH, 12); ctx.stroke();
+
+  ctx.font = "800 20px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.fillText('改修フェーズ', panelX + panelW / 2, panelY + 30);
+  ctx.font = "400 12px 'Satoshi',sans-serif"; ctx.fillStyle = '#6a7a8e';
+  ctx.fillText('砲台を選んでスロットをタップ', panelX + panelW / 2, panelY + 50);
+
+  // Turret options
+  const types = Object.keys(TURRET_DEFS);
+  const optH = 54;
+  let oy = panelY + 65;
+
+  for (const type of types) {
+    const def = TURRET_DEFS[type];
+    const sel = G.buildUI.selectedType === type;
+    const afford = canAfford(def.cost);
+    ctx.fillStyle = sel ? 'rgba(74,240,192,0.12)' : 'rgba(255,255,255,0.03)';
+    rr(ctx, panelX + 10, oy, panelW - 20, optH, 6); ctx.fill();
+    if (sel) { ctx.strokeStyle = 'rgba(74,240,192,0.4)'; ctx.lineWidth = 1; rr(ctx, panelX + 10, oy, panelW - 20, optH, 6); ctx.stroke(); }
+
+    ctx.textAlign = 'left';
+    ctx.font = "700 14px 'Satoshi',sans-serif";
+    ctx.fillStyle = afford ? '#fff' : '#445';
+    ctx.fillText(def.name, panelX + 22, oy + 19);
+    ctx.font = "400 11px 'Satoshi',sans-serif"; ctx.fillStyle = '#6a7a8e';
+    ctx.fillText(def.desc, panelX + 22, oy + 36);
+
+    // Cost
+    ctx.textAlign = 'right'; ctx.font = "500 10px 'Satoshi',sans-serif";
+    let cx2 = panelX + panelW - 18;
+    for (const [res, amt] of Object.entries(def.cost)) {
+      const has = (G.res[res] || 0) >= amt;
+      ctx.fillStyle = has ? RES_COL[res] : '#443333';
+      const txt = `${RES_NAME[res]}${amt}`;
+      ctx.fillText(txt, cx2, oy + 19);
+      cx2 -= ctx.measureText(txt).width + 8;
+    }
+
+    ctx.textAlign = 'right'; ctx.font = "400 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#556';
+    if (def.damage > 0) ctx.fillText(`DMG:${def.damage} RNG:${def.range}`, panelX + panelW - 18, oy + 45);
+    else if (def.slowFactor) ctx.fillText(`SLOW:${Math.round((1 - def.slowFactor) * 100)}% RNG:${def.range}`, panelX + panelW - 18, oy + 45);
+
+    oy += optH + 6;
+  }
+
+  // Existing turrets — upgrade section
+  oy += 10;
+  ctx.font = "700 14px 'Satoshi',sans-serif"; ctx.fillStyle = '#aabbcc';
+  ctx.textAlign = 'center';
+  ctx.fillText('— 既存砲台の強化 —', panelX + panelW / 2, oy);
+  oy += 20;
+
+  for (const slot of G.ship.slots) {
+    if (!slot.turret) continue;
+    const t = slot.turret;
+    const def = TURRET_DEFS[t.type];
+    const cost = upgradeCostFor(slot);
+    const afford = canAfford(cost);
+    const y2 = oy;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    rr(ctx, panelX + 10, y2, panelW - 20, 36, 4); ctx.fill();
+
+    ctx.textAlign = 'left'; ctx.font = "600 12px 'Satoshi',sans-serif";
+    ctx.fillStyle = '#ccc';
+    ctx.fillText(`${def.name} Lv.${t.level}`, panelX + 22, y2 + 14);
+
+    ctx.textAlign = 'left'; ctx.font = "400 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#888';
+    const dmg = Math.round(turretStat(def, t.level, 'damage'));
+    const rng = Math.round(turretStat(def, t.level, 'range'));
+    ctx.fillText(`DMG:${dmg} RNG:${rng}`, panelX + 22, y2 + 28);
+
+    // Upgrade button
+    const btnW = 60, btnH = 24, btnX = panelX + panelW - 78, btnY = y2 + 6;
+    ctx.fillStyle = afford ? '#01696f' : '#334';
+    rr(ctx, btnX, btnY, btnW, btnH, 4); ctx.fill();
+    ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = afford ? '#fff' : '#555';
+    ctx.textAlign = 'center';
+    ctx.fillText('強化', btnX + btnW / 2, btnY + btnH / 2 + 1);
+
+    oy += 40;
+  }
+
+  // Next wave button
+  const nbw = panelW - 40, nbh = 44, nbx = panelX + 20, nby = panelY + panelH - 60;
+  ctx.fillStyle = '#01696f'; rr(ctx, nbx, nby, nbw, nbh, 8); ctx.fill();
+  ctx.font = "700 16px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center'; ctx.fillText('次のWaveへ ▶', panelX + panelW / 2, nby + nbh / 2 + 1);
+
+  // === RIGHT SIDE: Ship with clickable slots ===
+  const shipCX = panelX + panelW + (W - panelX - panelW) / 2;
+  const shipCY = CY;
+
+  ctx.save();
+  ctx.translate(shipCX, shipCY);
+  const scale = 2.5;
+  ctx.scale(scale, scale);
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); shipPath(ctx, 1, 1, G.ship.w, G.ship.h); ctx.fill();
+  const hg = ctx.createLinearGradient(0, -G.ship.h / 2, 0, G.ship.h / 2);
+  hg.addColorStop(0, '#4a5a6e'); hg.addColorStop(0.5, '#3a4a5c'); hg.addColorStop(1, '#2a3a4c');
+  ctx.fillStyle = hg; ctx.beginPath(); shipPath(ctx, 0, 0, G.ship.w, G.ship.h); ctx.fill();
+  ctx.strokeStyle = 'rgba(100,140,180,0.3)'; ctx.lineWidth = 0.5;
+  ctx.beginPath(); shipPath(ctx, 0, 0, G.ship.w, G.ship.h); ctx.stroke();
+
+  // Slots
+  for (const slot of G.ship.slots) {
+    if (slot.turret) {
+      renderTurret(slot);
+      ctx.font = "bold 5px sans-serif"; ctx.fillStyle = '#4af0c0';
+      ctx.textAlign = 'center'; ctx.fillText(`Lv${slot.turret.level}`, slot.rx, slot.ry + 12);
+    } else {
+      const highlight = G.buildUI.selectedType !== null;
+      ctx.fillStyle = highlight ? 'rgba(74,240,192,0.25)' : 'rgba(100,150,200,0.15)';
+      ctx.beginPath(); ctx.arc(slot.rx, slot.ry, 8, 0, TAU); ctx.fill();
+      ctx.strokeStyle = highlight ? 'rgba(74,240,192,0.6)' : 'rgba(100,150,200,0.3)';
+      ctx.lineWidth = highlight ? 1 : 0.5; ctx.stroke();
+      ctx.fillStyle = highlight ? '#4af0c0' : 'rgba(100,150,200,0.5)';
+      ctx.font = "bold 8px sans-serif"; ctx.textAlign = 'center';
+      ctx.fillText('+', slot.rx, slot.ry + 3);
+    }
+  }
+  ctx.restore();
+
+  ctx.font = "400 12px 'Satoshi',sans-serif"; ctx.fillStyle = '#6a7a8e';
+  ctx.textAlign = 'center';
+  ctx.fillText('空きスロット (+) をクリックして設置', shipCX, shipCY + G.ship.h * scale / 2 + 30);
+}
+
+// Mobile build UI: vertical layout, ship on top, options below
+function renderBuildMobile() {
+  // Ship at top
+  const shipCX = CX;
+  const shipCY = 140;
+  const scale = 1.8;
+
+  ctx.save();
+  ctx.translate(shipCX, shipCY);
+  ctx.scale(scale, scale);
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); shipPath(ctx, 1, 1, G.ship.w, G.ship.h); ctx.fill();
+  const hg = ctx.createLinearGradient(0, -G.ship.h / 2, 0, G.ship.h / 2);
+  hg.addColorStop(0, '#4a5a6e'); hg.addColorStop(0.5, '#3a4a5c'); hg.addColorStop(1, '#2a3a4c');
+  ctx.fillStyle = hg; ctx.beginPath(); shipPath(ctx, 0, 0, G.ship.w, G.ship.h); ctx.fill();
+  ctx.strokeStyle = 'rgba(100,140,180,0.3)'; ctx.lineWidth = 0.5;
+  ctx.beginPath(); shipPath(ctx, 0, 0, G.ship.w, G.ship.h); ctx.stroke();
+  for (const slot of G.ship.slots) {
+    if (slot.turret) {
+      renderTurret(slot);
+      ctx.font = "bold 4px sans-serif"; ctx.fillStyle = '#4af0c0';
+      ctx.textAlign = 'center'; ctx.fillText(`Lv${slot.turret.level}`, slot.rx, slot.ry + 10);
+    } else {
+      const highlight = G.buildUI.selectedType !== null;
+      ctx.fillStyle = highlight ? 'rgba(74,240,192,0.25)' : 'rgba(100,150,200,0.15)';
+      ctx.beginPath(); ctx.arc(slot.rx, slot.ry, 7, 0, TAU); ctx.fill();
+      ctx.strokeStyle = highlight ? 'rgba(74,240,192,0.6)' : 'rgba(100,150,200,0.3)';
+      ctx.lineWidth = highlight ? 0.8 : 0.4; ctx.stroke();
+      ctx.fillStyle = highlight ? '#4af0c0' : 'rgba(100,150,200,0.5)';
+      ctx.font = "bold 7px sans-serif"; ctx.textAlign = 'center';
+      ctx.fillText('+', slot.rx, slot.ry + 2.5);
+    }
+  }
+  ctx.restore();
+
+  ctx.font = "400 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#6a7a8e';
+  ctx.textAlign = 'center';
+  ctx.fillText('空きスロット(+)をタップして設置', shipCX, shipCY + G.ship.h * scale / 2 + 18);
+
+  // Panel below ship
+  const panelX = 10, panelW = W - 20;
+  const panelY = shipCY + G.ship.h * scale / 2 + 32;
+
+  ctx.fillStyle = 'rgba(15,20,35,0.95)';
+  rr(ctx, panelX, panelY, panelW, H - panelY - 10, 10); ctx.fill();
+
+  ctx.font = "700 16px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.fillText('改修フェーズ', CX, panelY + 20);
+
+  // Turret options in 2-column grid
+  const types = Object.keys(TURRET_DEFS);
+  const colW = (panelW - 30) / 2;
+  const optH = 44;
+  let row = 0;
+  for (let i = 0; i < types.length; i++) {
+    const col = i % 2;
+    if (col === 0 && i > 0) row++;
+    const type = types[i];
+    const def = TURRET_DEFS[type];
+    const sel = G.buildUI.selectedType === type;
+    const afford = canAfford(def.cost);
+    const ox = panelX + 10 + col * (colW + 10);
+    const oy2 = panelY + 35 + row * (optH + 6);
+
+    ctx.fillStyle = sel ? 'rgba(74,240,192,0.12)' : 'rgba(255,255,255,0.03)';
+    rr(ctx, ox, oy2, colW, optH, 5); ctx.fill();
+    if (sel) { ctx.strokeStyle = 'rgba(74,240,192,0.4)'; ctx.lineWidth = 1; rr(ctx, ox, oy2, colW, optH, 5); ctx.stroke(); }
+
+    ctx.textAlign = 'left'; ctx.font = "700 12px 'Satoshi',sans-serif";
+    ctx.fillStyle = afford ? '#fff' : '#445';
+    ctx.fillText(def.name, ox + 8, oy2 + 16);
+    ctx.font = "400 9px 'Satoshi',sans-serif"; ctx.fillStyle = '#6a7a8e';
+    ctx.fillText(def.desc.substring(0, 10), ox + 8, oy2 + 30);
+
+    ctx.textAlign = 'right'; ctx.font = "500 9px 'Satoshi',sans-serif";
+    let cx2 = ox + colW - 6;
+    for (const [res, amt] of Object.entries(def.cost)) {
+      const has = (G.res[res] || 0) >= amt;
+      ctx.fillStyle = has ? RES_COL[res] : '#443333';
+      const RES_S = { iron: '鉄', gunpowder: '火', electronics: '電', brass: '真' };
+      const txt = `${RES_S[res]}${amt}`;
+      ctx.fillText(txt, cx2, oy2 + 16);
+      cx2 -= ctx.measureText(txt).width + 5;
+    }
+  }
+
+  // Existing turrets upgrade row
+  const upgY = panelY + 35 + (Math.ceil(types.length / 2)) * (optH + 6) + 6;
+  const existingTurrets = G.ship.slots.filter(s => s.turret);
+  if (existingTurrets.length > 0) {
+    ctx.font = "600 11px 'Satoshi',sans-serif"; ctx.fillStyle = '#aabbcc';
+    ctx.textAlign = 'center';
+    ctx.fillText('— 強化 —', CX, upgY);
+    let uy = upgY + 14;
+    for (const slot of existingTurrets) {
+      const t = slot.turret;
+      const def = TURRET_DEFS[t.type];
+      const cost = upgradeCostFor(slot);
+      const afford = canAfford(cost);
+
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      rr(ctx, panelX + 10, uy, panelW - 20, 28, 4); ctx.fill();
+      ctx.textAlign = 'left'; ctx.font = "600 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#ccc';
+      ctx.fillText(`${def.name} Lv.${t.level}`, panelX + 18, uy + 17);
+
+      const btnW = 48, btnH = 20, btnX = panelX + panelW - 58, btnY2 = uy + 4;
+      ctx.fillStyle = afford ? '#01696f' : '#334';
+      rr(ctx, btnX, btnY2, btnW, btnH, 3); ctx.fill();
+      ctx.font = "600 9px 'Satoshi',sans-serif"; ctx.fillStyle = afford ? '#fff' : '#555';
+      ctx.textAlign = 'center';
+      ctx.fillText('強化', btnX + btnW / 2, btnY2 + btnH / 2 + 1);
+      uy += 32;
+    }
+  }
+
+  // Next wave button at very bottom
+  const nbw = panelW - 20, nbh = 38, nbx = panelX + 10, nby = H - 55;
+  ctx.fillStyle = '#01696f'; rr(ctx, nbx, nby, nbw, nbh, 6); ctx.fill();
+  ctx.font = "700 14px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center'; ctx.fillText('次のWaveへ ▶', CX, nby + nbh / 2 + 1);
+}
+
+function renderBuildSlot() { /* currently unused — all in main */ }
+
+function handleBuildClick() {
+  // We process clicks via pointer events
+  if (pointers.size === 0) return;
+  const ptr = [...pointers.values()][0]; // Use first pointer
+  const mx = ptr.x, my = ptr.y;
+
+  // Debounce: only process on initial press
+  if (Date.now() - ptr.startTime > 100) return;
+  ptr.startTime = 0; // consume
+
+  const mobile = W < 600;
+  if (mobile) {
+    handleBuildClickMobile(mx, my);
+    return;
+  }
+
+  const panelW = Math.min(340, W * 0.4);
+  const panelX = 20, panelY = 60;
+
+  // Check turret type selection
+  const types = Object.keys(TURRET_DEFS);
+  const optH = 54;
+  let oy = panelY + 65;
+  for (const type of types) {
+    if (mx > panelX + 10 && mx < panelX + panelW - 10 && my > oy && my < oy + optH) {
+      if (canAfford(TURRET_DEFS[type].cost)) {
+        G.buildUI.selectedType = type;
+        sfx('build');
+      }
+      return;
+    }
+    oy += optH + 6;
+  }
+
+  // Check upgrade buttons
+  oy += 30; // skip header
+  for (const slot of G.ship.slots) {
+    if (!slot.turret) continue;
+    const btnW = 60, btnX = panelX + panelW - 78, btnY = oy + 6;
+    if (mx > btnX && mx < btnX + btnW && my > btnY && my < btnY + 24) {
+      upgradeTurret(slot.id);
+      return;
+    }
+    oy += 40;
+  }
+
+  // Check next wave button
+  const nbw = panelW - 40, nbh = 44, nbx = panelX + 20, nby = panelY + (H - 80) - 60;
+  if (mx > nbx && mx < nbx + nbw && my > nby && my < nby + nbh) {
+    G.phase = 'playing';
+    startWave(G.wave + 1);
+    G.buildUI.selectedType = null;
+    return;
+  }
+
+  // Check ship slot clicks (right side)
+  if (G.buildUI.selectedType) {
+    const shipCX = panelX + panelW + (W - panelX - panelW) / 2;
+    const shipCY = CY;
+    const scale = 2.5;
+
+    for (const slot of G.ship.slots) {
+      if (slot.turret) continue;
+      const sx = shipCX + slot.rx * scale;
+      const sy = shipCY + slot.ry * scale;
+      if (dist(mx, my, sx, sy) < 22) {
+        const cost = TURRET_DEFS[G.buildUI.selectedType].cost;
+        if (canAfford(cost)) {
+          spend(cost);
+          placeTurret(slot.id, G.buildUI.selectedType);
+          sfx('build');
+          notify(`${TURRET_DEFS[G.buildUI.selectedType].name}を設置`);
+        }
+        return;
+      }
+    }
+  }
+}
+
+function handleBuildClickMobile(mx, my) {
+  const shipCX = CX;
+  const shipCY = 140;
+  const scale = 1.8;
+
+  // Check ship slot clicks (top area)
+  if (G.buildUI.selectedType) {
+    for (const slot of G.ship.slots) {
+      if (slot.turret) continue;
+      const sx = shipCX + slot.rx * scale;
+      const sy = shipCY + slot.ry * scale;
+      if (dist(mx, my, sx, sy) < 18) {
+        const cost = TURRET_DEFS[G.buildUI.selectedType].cost;
+        if (canAfford(cost)) {
+          spend(cost);
+          placeTurret(slot.id, G.buildUI.selectedType);
+          sfx('build');
+          notify(`${TURRET_DEFS[G.buildUI.selectedType].name}を設置`);
+        }
+        return;
+      }
+    }
+  }
+
+  const panelX = 10, panelW = W - 20;
+  const panelY = shipCY + G.ship.h * scale / 2 + 32;
+
+  // Turret type selection (2-col grid)
+  const types = Object.keys(TURRET_DEFS);
+  const colW = (panelW - 30) / 2;
+  const optH = 44;
+  let row = 0;
+  for (let i = 0; i < types.length; i++) {
+    const col = i % 2;
+    if (col === 0 && i > 0) row++;
+    const ox = panelX + 10 + col * (colW + 10);
+    const oy2 = panelY + 35 + row * (optH + 6);
+    if (mx > ox && mx < ox + colW && my > oy2 && my < oy2 + optH) {
+      if (canAfford(TURRET_DEFS[types[i]].cost)) {
+        G.buildUI.selectedType = types[i];
+        sfx('build');
+      }
+      return;
+    }
+  }
+
+  // Upgrade buttons
+  const upgY = panelY + 35 + (Math.ceil(types.length / 2)) * (optH + 6) + 6;
+  const existingTurrets = G.ship.slots.filter(s => s.turret);
+  let uy = upgY + 14;
+  for (const slot of existingTurrets) {
+    const btnW = 48, btnX = panelX + panelW - 58, btnY2 = uy + 4;
+    if (mx > btnX && mx < btnX + btnW && my > btnY2 && my < btnY2 + 20) {
+      upgradeTurret(slot.id);
+      return;
+    }
+    uy += 32;
+  }
+
+  // Next wave button
+  const nbw = panelW - 20, nbh = 38, nbx = panelX + 10, nby = H - 55;
+  if (mx > nbx && mx < nbx + nbw && my > nby && my < nby + nbh) {
+    G.phase = 'playing';
+    startWave(G.wave + 1);
+    G.buildUI.selectedType = null;
+    return;
+  }
+}
+
+function renderTitle() {
+  ctx.fillStyle = '#0a1628'; ctx.fillRect(0, 0, W, H);
+  const t = G.time;
+  const mobile = W < 600;
+  ctx.strokeStyle = 'rgba(60,100,180,0.12)'; ctx.lineWidth = 1;
+  for (let row = 0; row < H; row += 40) {
+    ctx.beginPath();
+    for (let x = 0; x < W; x += 3) {
+      const w = Math.sin(x * 0.01 + t * 0.5 + row * 0.01) * 8;
+      x === 0 ? ctx.moveTo(x, row + w) : ctx.lineTo(x, row + w);
+    }
+    ctx.stroke();
+  }
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(74,240,192,0.35)'; ctx.shadowBlur = 40;
+  ctx.font = `800 ${mobile ? 38 : 60}px 'Cabinet Grotesk',sans-serif`; ctx.fillStyle = '#fff';
+  ctx.fillText('STEEL AEGIS', CX, CY - 75); ctx.shadowBlur = 0;
+  ctx.font = `500 ${mobile ? 14 : 18}px 'Satoshi',sans-serif`; ctx.fillStyle = '#4af0c0';
+  ctx.fillText('TowerDefence × Battleship', CX, CY - 30);
+  ctx.font = `400 ${mobile ? 11 : 14}px 'Satoshi',sans-serif`; ctx.fillStyle = '#6a8aaa';
+  if (mobile) {
+    ctx.fillText('タップで砲台を操作。', CX, CY + 5);
+    ctx.fillText('敵を撃墜し、スクラップで戦艦を強化せよ。', CX, CY + 22);
+  } else {
+    ctx.fillText('タップで砲台を操作。敵を撃墜し、スクラップで戦艦を強化せよ。', CX, CY + 10);
+  }
+  const pulse = 0.6 + Math.sin(t * 3) * 0.4;
+  ctx.font = `700 ${mobile ? 16 : 20}px 'Cabinet Grotesk',sans-serif`;
+  ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+  ctx.fillText('TAP TO START', CX, CY + (mobile ? 60 : 65));
+  ctx.font = `400 ${mobile ? 10 : 12}px 'Satoshi',sans-serif`; ctx.fillStyle = '#445566';
+  ctx.fillText(mobile ? 'マルチタッチで分散砲火' : 'タップ位置に砲台が向く — マルチタッチで分散砲火', CX, CY + (mobile ? 90 : 110));
+  if (!mobile) { ctx.fillText('M: ミュート', CX, CY + 130); }
+  ctx.restore();
+}
+
+function renderGameOver() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,10,20,0.8)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(255,68,102,0.5)'; ctx.shadowBlur = 30;
+  ctx.font = "800 52px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#ff4466';
+  ctx.fillText('SUNK', CX, CY - 55); ctx.shadowBlur = 0;
+  ctx.font = "500 17px 'Satoshi',sans-serif"; ctx.fillStyle = '#aabbcc';
+  ctx.fillText(`Wave ${G.wave + 1} まで到達`, CX, CY - 5);
+  ctx.fillText(`スコア: ${G.score}  撃墜: ${G.kills}`, CX, CY + 25);
+  const pulse = 0.6 + Math.sin(G.time * 3) * 0.4;
+  ctx.font = "700 18px 'Cabinet Grotesk',sans-serif";
+  ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+  ctx.fillText('TAP TO RETRY', CX, CY + 85);
+  ctx.restore();
+}
+
+function renderAnnounce() {
+  if (!G.announce) return;
+  G.announce.timer -= 1 / 60;
+  if (G.announce.timer <= 0) { G.announce = null; return; }
+  const progress = 1 - G.announce.timer / 2.5;
+  const alpha = progress < 0.1 ? progress / 0.1 : progress > 0.8 ? (1 - progress) / 0.2 : 1;
+  ctx.save(); ctx.globalAlpha = alpha;
+  ctx.font = "800 44px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 20;
+  ctx.fillText(G.announce.text, CX, CY - 50);
+  ctx.restore();
+}
+
+function renderNotifs() {
+  let y = H - 70;
+  for (let i = G.notifications.length - 1; i >= 0; i--) {
+    const n = G.notifications[i];
+    n.timer -= 1 / 60;
+    if (n.timer <= 0) { G.notifications.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = Math.min(n.timer, 1);
+    ctx.font = "500 14px 'Satoshi',sans-serif"; ctx.textAlign = 'center';
+    ctx.fillStyle = '#4af0c0'; ctx.fillText(n.text, CX, y);
+    ctx.restore();
+    y -= 22;
+  }
+}
+
+function renderDebug() {
+  ctx.save();
+  const dbg = `FPS:${fps.toFixed(0)} E:${G.enemies.length} B:${G.bullets.length} T:${G.torpedoes.length} P:${particles.length}`;
+  ctx.font = '9px monospace';
+  const tw = ctx.measureText(dbg).width + 8;
+  ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(W - tw, H - 14, tw, 14);
+  ctx.fillStyle = fps < 30 ? '#f44' : '#0f0';
+  ctx.textAlign = 'right';
+  ctx.fillText(dbg, W - 4, H - 3);
+  ctx.restore();
+}
+
+function rr(c, x, y, w, h, r) {
+  c.beginPath(); c.moveTo(x + r, y); c.lineTo(x + w - r, y);
+  c.arcTo(x + w, y, x + w, y + r, r); c.lineTo(x + w, y + h - r);
+  c.arcTo(x + w, y + h, x + w - r, y + h, r); c.lineTo(x + r, y + h);
+  c.arcTo(x, y + h, x, y + h - r, r); c.lineTo(x, y + r);
+  c.arcTo(x, y, x + r, y, r); c.closePath();
+}
+
+// ─── GAME LIFECYCLE ─────────────────────────────────────
+function startGame() {
+  G.phase = 'playing';
+  G.ship.hp = G.ship.maxHp;
+  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 0 };
+  initSlots();
+  placeTurret(0, 'machineGun'); // bow
+  placeTurret(7, 'machineGun'); // stern
+  startWave(0);
+}
+
+function resetGame() {
+  G.phase = 'playing';
+  G.wave = 0; G.score = 0; G.kills = 0;
+  G.enemies = []; G.bullets = []; G.scraps = []; G.torpedoes = [];
+  G.spawnQueues = []; G.notifications = [];
+  G.dmgFlash = 0; shakeAmt = 0;
+  particles.length = 0;
+  G.ship.hp = G.ship.maxHp;
+  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 0 };
+  initSlots();
+  placeTurret(0, 'machineGun');
+  placeTurret(7, 'machineGun');
+  startWave(0);
+}
+
+// ─── GAME LOOP ──────────────────────────────────────────
+let lastT = 0, accum = 0, fps = 60, frames = 0, fpsT = 0;
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((ts - lastT) / 1000, 0.1);
+  lastT = ts; accum += dt * 1000;
+  frames++;
+  if (ts - fpsT >= 1000) { fps = frames * 1000 / (ts - fpsT); frames = 0; fpsT = ts; }
+  while (accum >= TICK) { update(TICK / 1000); accum -= TICK; }
+  render();
+}
+requestAnimationFrame(loop);
+
+// ─── TEST HOOKS ─────────────────────────────────────────
+window.advanceTime = ms => {
+  const steps = Math.max(1, Math.round(ms / TICK));
+  for (let i = 0; i < steps; i++) update(TICK / 1000);
+  render();
+};
+window.render_game_to_text = () => JSON.stringify({
+  phase: G.phase, wave: G.wave, score: G.score,
+  shipHp: G.ship.hp, enemies: G.enemies.length,
+  bullets: G.bullets.length, torpedoes: G.torpedoes.length,
+  scraps: G.scraps.length, resources: G.res,
+  turrets: G.ship.slots.filter(s => s.turret).map(s => ({
+    type: s.turret.type, slot: s.id, level: s.turret.level,
+    angle: (s.turret.angle / DEG).toFixed(0) + '°',
+  })),
+  pointers: pointers.size,
+});
+
+// Mute
+addEventListener('keydown', e => {
+  if (e.code === 'KeyM' && audioCtx) {
+    audioCtx.state === 'running' ? audioCtx.suspend() : audioCtx.resume();
+  }
+});
+
+console.log('STEEL AEGIS v2 loaded — tap to aim, multi-touch for spread fire');
