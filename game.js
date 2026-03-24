@@ -362,7 +362,7 @@ const ENEMY_DEFS = {
     behavior: 'orbit', orbits: 2, orbitRadius: 180,
   },
   fastDrone: {
-    name: '高速ドローン', hp: 25, speed: 130, torpedoDmg: 15, score: 15, size: 9,
+    name: '高速ドローン', hp: 15, speed: 130, torpedoDmg: 15, score: 15, size: 9,
     color: '#55cc88', drop: { iron: 1, electronics: 1 },
     behavior: 'strafe', strafeOffset: 100,
   },
@@ -377,7 +377,7 @@ const ENEMY_DEFS = {
     behavior: 'orbit', orbits: 2, orbitRadius: 120,
   },
   stealthDrone: {
-    name: 'ステルス', hp: 50, speed: 110, torpedoDmg: 25, score: 30, size: 9,
+    name: 'ステルス', hp: 30, speed: 110, torpedoDmg: 25, score: 30, size: 9,
     color: '#4488aa', drop: { electronics: 3, brass: 1 },
     behavior: 'strafe', strafeOffset: 80, stealth: true,
   },
@@ -389,7 +389,7 @@ const ENEMY_DEFS = {
     jammerResist: 0.8,
   },
   fastDrone_jr: {
-    name: '耐妨高速機', hp: 30, speed: 135, torpedoDmg: 17, score: 25, size: 9,
+    name: '耐妨高速機', hp: 20, speed: 135, torpedoDmg: 17, score: 25, size: 9,
     color: '#ddbb44', drop: { iron: 1, electronics: 1, brass: 1 },
     behavior: 'strafe', strafeOffset: 100,
     jammerResist: 0.85,
@@ -607,7 +607,8 @@ function dropTorpedo(enemy) {
     const tgtX = G.ship.x + rand(-30, 30) + spread;
     const tgtY = G.ship.y + rand(-15, 15);
     const baseTorpSpeed = enemy.torpedoDmg >= 40 ? 110 : 90;
-    const torpHp = enemy.isBoss ? 50 : (enemy.torpedoDmg >= 40 ? 30 : 15);
+    // Normal torpedo: 1 MG bullet kill; heavy (bomber): 1 burst; boss: tough
+    const torpHp = enemy.isBoss ? 25 : (enemy.torpedoDmg >= 40 ? 15 : 4);
     G.torpedoes.push({
       x: enemy.x, y: enemy.y,
       tx: tgtX, ty: tgtY,
