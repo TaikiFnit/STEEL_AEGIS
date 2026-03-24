@@ -302,22 +302,22 @@ function updateShake() {
 // Stats scale by level: base * (1 + 0.3 * (lv - 1))
 const TURRET_DEFS = {
   machineGun: {
-    name: '機銃', desc: '高速連射対空機銃',
-    range: 220, fireRate: 0.07, damage: 8, bulletSpeed: 900,
+    name: '機銃', desc: '高速連射 — 小型敵・魚雷迎撃に最適',
+    range: 220, fireRate: 0.07, damage: 4, bulletSpeed: 900,
     barrels: 2, spread: 3 * DEG, tracerCol: '#ffcc33',
     cost: { iron: 8, gunpowder: 4 },
     upgradeCost: { iron: 6, gunpowder: 3 }, // per level
     burstSize: 5, burstDelay: 0.04, burstCooldown: 0.35,
-    rotSpeed: 2.2 * DEG, // degrees per tick → radians per second (slow turret rotation)
-    arcLimit: 150 * DEG, // can aim 150° from its base facing
+    rotSpeed: 2.2 * DEG,
+    arcLimit: 150 * DEG,
   },
   flak: {
-    name: '高射砲', desc: '空中炸裂弾 — 範囲ダメージ',
-    range: 320, fireRate: 1.2, damage: 45, bulletSpeed: 500,
+    name: '高射砲', desc: '炸裂弾 — 大型敵に有効、範囲ダメージ',
+    range: 320, fireRate: 1.0, damage: 80, bulletSpeed: 500,
     barrels: 1, spread: 0, tracerCol: '#ff6622',
     cost: { iron: 18, gunpowder: 12, brass: 4 },
     upgradeCost: { iron: 12, gunpowder: 8, brass: 3 },
-    aoe: 65, burstSize: 1, burstDelay: 0, burstCooldown: 1.3,
+    aoe: 70, burstSize: 1, burstDelay: 0, burstCooldown: 1.0,
     rotSpeed: 1.5 * DEG,
     arcLimit: 160 * DEG,
   },
@@ -408,7 +408,7 @@ const ENEMY_DEFS = {
   },
   // ── Boss enemy (W5, 10, 15, 20...) ──
   boss: {
-    name: 'ドレッドノート', hp: 800, speed: 30, torpedoDmg: 80, score: 200, size: 32,
+    name: 'ドレッドノート', hp: 2000, speed: 30, torpedoDmg: 80, score: 200, size: 32,
     color: '#eeeeee', drop: { iron: 10, gunpowder: 6, electronics: 5, brass: 3 },
     behavior: 'orbit', orbits: 3, orbitRadius: 160,
     isBoss: true,
