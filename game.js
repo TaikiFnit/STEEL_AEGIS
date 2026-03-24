@@ -358,58 +358,58 @@ function turretStat(def, lv, stat) {
 const ENEMY_DEFS = {
   scoutDrone: {
     name: '偵察ドローン', hp: 35, speed: 80, torpedoDmg: 12, score: 10, size: 10,
-    color: '#44aacc', drop: { iron: 3, gunpowder: 1, brass: 1 },
+    color: '#44aacc', drop: { iron: 1, gunpowder: 1 },
     behavior: 'orbit', orbits: 2, orbitRadius: 180,
   },
   fastDrone: {
     name: '高速ドローン', hp: 25, speed: 130, torpedoDmg: 15, score: 15, size: 9,
-    color: '#55cc88', drop: { iron: 2, electronics: 2, brass: 1 },
+    color: '#55cc88', drop: { iron: 1, electronics: 1 },
     behavior: 'strafe', strafeOffset: 100,
   },
   bomber: {
     name: '爆撃機', hp: 120, speed: 50, torpedoDmg: 40, score: 35, size: 18,
-    color: '#6688cc', drop: { iron: 8, gunpowder: 5, brass: 3 },
+    color: '#6688cc', drop: { iron: 3, gunpowder: 2, brass: 1 },
     behavior: 'orbit', orbits: 1, orbitRadius: 140,
   },
   heavyDrone: {
     name: '重装ドローン', hp: 200, speed: 40, torpedoDmg: 50, score: 55, size: 22,
-    color: '#7766bb', drop: { iron: 12, gunpowder: 8, electronics: 5, brass: 2 },
+    color: '#7766bb', drop: { iron: 4, gunpowder: 3, electronics: 2, brass: 1 },
     behavior: 'orbit', orbits: 2, orbitRadius: 120,
   },
   stealthDrone: {
     name: 'ステルス', hp: 50, speed: 110, torpedoDmg: 25, score: 30, size: 9,
-    color: '#4488aa', drop: { electronics: 8, brass: 3 },
+    color: '#4488aa', drop: { electronics: 3, brass: 1 },
     behavior: 'strafe', strafeOffset: 80, stealth: true,
   },
   // ── Jammer-Resistant variants (W20+) ──
   scoutDrone_jr: {
     name: '耐妨偵察機', hp: 45, speed: 85, torpedoDmg: 14, score: 18, size: 10,
-    color: '#ccaa33', drop: { iron: 4, gunpowder: 2, brass: 2 },
+    color: '#ccaa33', drop: { iron: 1, gunpowder: 1, brass: 1 },
     behavior: 'orbit', orbits: 2, orbitRadius: 180,
     jammerResist: 0.8,
   },
   fastDrone_jr: {
     name: '耐妨高速機', hp: 30, speed: 135, torpedoDmg: 17, score: 25, size: 9,
-    color: '#ddbb44', drop: { iron: 3, electronics: 3, brass: 2 },
+    color: '#ddbb44', drop: { iron: 1, electronics: 1, brass: 1 },
     behavior: 'strafe', strafeOffset: 100,
     jammerResist: 0.85,
   },
   bomber_jr: {
     name: '耐妨爆撃機', hp: 140, speed: 55, torpedoDmg: 45, score: 50, size: 18,
-    color: '#bb9933', drop: { iron: 10, gunpowder: 6, brass: 4 },
+    color: '#bb9933', drop: { iron: 3, gunpowder: 2, brass: 1 },
     behavior: 'orbit', orbits: 1, orbitRadius: 140,
     jammerResist: 0.9,
   },
   heavyDrone_jr: {
     name: '耐妨重装機', hp: 240, speed: 42, torpedoDmg: 55, score: 70, size: 22,
-    color: '#aa8822', drop: { iron: 15, gunpowder: 10, electronics: 6, brass: 3 },
+    color: '#aa8822', drop: { iron: 5, gunpowder: 3, electronics: 2, brass: 1 },
     behavior: 'orbit', orbits: 2, orbitRadius: 120,
     jammerResist: 0.9,
   },
   // ── Boss enemy (W5, 10, 15, 20...) ──
   boss: {
     name: 'ドレッドノート', hp: 800, speed: 30, torpedoDmg: 80, score: 200, size: 32,
-    color: '#eeeeee', drop: { iron: 30, gunpowder: 20, electronics: 15, brass: 10 },
+    color: '#eeeeee', drop: { iron: 10, gunpowder: 6, electronics: 5, brass: 3 },
     behavior: 'orbit', orbits: 3, orbitRadius: 160,
     isBoss: true,
   },
@@ -558,7 +558,13 @@ function spawnEnemy(type) {
   const orbitAngle = ang(G.ship.x, G.ship.y, ex, ey); // angle FROM ship TO enemy
 
   const hpScale = G.waveHpScale || 1;
-  const scaledHp = Math.round(def.hp * hpScale);
+  // Orbit-type enemies get extra HP from W10+ (they're easier to kill)
+  // Strafe/dive types keep base scaling so torpedoes remain avoidable
+  const waveNum = (G.wave || 0) + 1;
+  const orbitHpBonus = (def.behavior === 'orbit' && !def.isBoss && waveNum >= 10)
+    ? 1 + (waveNum - 9) * 0.15  // +15% per wave past W9
+    : 1;
+  const scaledHp = Math.round(def.hp * hpScale * orbitHpBonus);
   const enemy = {
     type, x: ex, y: ey,
     hp: scaledHp, maxHp: scaledHp,
@@ -660,50 +666,50 @@ function genWaves() {
     { groups: [{ type: 'fastDrone', count: 12, interval: 0.8 }] },
     // W5: BOSS + escorts
     { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'scoutDrone', count: 6, interval: 1.5 }] },
-    // W6: bombers intro
-    { groups: [{ type: 'fastDrone', count: 10, interval: 0.9 }, { type: 'bomber', count: 3, interval: 3.5 }] },
-    // W7: heavy drones
-    { groups: [{ type: 'heavyDrone', count: 3, interval: 4.0 }, { type: 'scoutDrone', count: 12, interval: 0.8 }] },
-    // W8: stealth + bombers
-    { groups: [{ type: 'stealthDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }] },
-    // W9: everything ramp
-    { groups: [{ type: 'fastDrone', count: 15, interval: 0.5 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'bomber', count: 4, interval: 2.5 }] },
+    // W6: bombers intro — more scouts flooding in
+    { groups: [{ type: 'fastDrone', count: 14, interval: 0.7 }, { type: 'bomber', count: 4, interval: 3.0 }, { type: 'scoutDrone', count: 8, interval: 0.9 }] },
+    // W7: heavy drones + scout swarm
+    { groups: [{ type: 'heavyDrone', count: 4, interval: 3.5 }, { type: 'scoutDrone', count: 18, interval: 0.5 }] },
+    // W8: stealth + bombers + scouts
+    { groups: [{ type: 'stealthDrone', count: 6, interval: 2.0 }, { type: 'bomber', count: 6, interval: 1.8 }, { type: 'scoutDrone', count: 10, interval: 0.7 }] },
+    // W9: everything ramp — dense
+    { groups: [{ type: 'fastDrone', count: 18, interval: 0.4 }, { type: 'heavyDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W10: BOSS + heavy escorts
-    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'bomber', count: 4, interval: 2.5 }] },
-    // W11: stealth swarm
-    { groups: [{ type: 'stealthDrone', count: 10, interval: 1.2 }, { type: 'fastDrone', count: 8, interval: 1.0 }] },
-    // W12: bomber wave
-    { groups: [{ type: 'bomber', count: 8, interval: 2.0 }, { type: 'scoutDrone', count: 10, interval: 0.8 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'heavyDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
+    // W11: stealth swarm + orbit wall
+    { groups: [{ type: 'stealthDrone', count: 12, interval: 1.0 }, { type: 'fastDrone', count: 10, interval: 0.8 }, { type: 'scoutDrone', count: 14, interval: 0.5 }] },
+    // W12: bomber wave + scout flood
+    { groups: [{ type: 'bomber', count: 10, interval: 1.5 }, { type: 'scoutDrone', count: 18, interval: 0.4 }] },
     // W13: heavy + stealth combo
-    { groups: [{ type: 'heavyDrone', count: 6, interval: 2.5 }, { type: 'stealthDrone', count: 8, interval: 1.5 }] },
+    { groups: [{ type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'stealthDrone', count: 10, interval: 1.2 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W14: everything dense
-    { groups: [{ type: 'scoutDrone', count: 15, interval: 0.5 }, { type: 'bomber', count: 6, interval: 2.0 }, { type: 'heavyDrone', count: 3, interval: 3.5 }] },
+    { groups: [{ type: 'scoutDrone', count: 22, interval: 0.3 }, { type: 'bomber', count: 8, interval: 1.5 }, { type: 'heavyDrone', count: 5, interval: 2.5 }] },
     // W15: BOSS + full mix
-    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'fastDrone', count: 12, interval: 0.7 }, { type: 'bomber', count: 5, interval: 2.5 }, { type: 'stealthDrone', count: 4, interval: 3.0 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'fastDrone', count: 15, interval: 0.5 }, { type: 'bomber', count: 7, interval: 2.0 }, { type: 'stealthDrone', count: 6, interval: 2.5 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
     // W16: fast chaos
-    { groups: [{ type: 'fastDrone', count: 20, interval: 0.4 }, { type: 'bomber', count: 3, interval: 4.0 }] },
+    { groups: [{ type: 'fastDrone', count: 25, interval: 0.3 }, { type: 'bomber', count: 5, interval: 3.0 }, { type: 'scoutDrone', count: 15, interval: 0.4 }] },
     // W17: stealth bombers
-    { groups: [{ type: 'stealthDrone', count: 12, interval: 1.0 }, { type: 'bomber', count: 8, interval: 1.8 }] },
+    { groups: [{ type: 'stealthDrone', count: 15, interval: 0.8 }, { type: 'bomber', count: 10, interval: 1.5 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W18: heavy assault
-    { groups: [{ type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'fastDrone', count: 10, interval: 0.8 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
-    // W19: calm before storm
-    { groups: [{ type: 'scoutDrone', count: 20, interval: 0.3 }, { type: 'stealthDrone', count: 8, interval: 1.5 }] },
+    { groups: [{ type: 'heavyDrone', count: 10, interval: 1.5 }, { type: 'fastDrone', count: 14, interval: 0.6 }, { type: 'scoutDrone', count: 16, interval: 0.4 }] },
+    // W19: calm before storm — scout flood
+    { groups: [{ type: 'scoutDrone', count: 30, interval: 0.2 }, { type: 'stealthDrone', count: 10, interval: 1.2 }] },
     // W20: BOSS + jammer-resist debut!
-    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'scoutDrone_jr', count: 6, interval: 2.0 }, { type: 'fastDrone_jr', count: 4, interval: 2.5 }, { type: 'bomber', count: 4, interval: 3.0 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'scoutDrone_jr', count: 10, interval: 1.5 }, { type: 'fastDrone_jr', count: 6, interval: 2.0 }, { type: 'bomber', count: 6, interval: 2.5 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W21: jammer-resist scouts mix
-    { groups: [{ type: 'scoutDrone_jr', count: 10, interval: 1.0 }, { type: 'scoutDrone', count: 10, interval: 0.8 }, { type: 'fastDrone', count: 6, interval: 1.2 }] },
+    { groups: [{ type: 'scoutDrone_jr', count: 14, interval: 0.7 }, { type: 'scoutDrone', count: 16, interval: 0.5 }, { type: 'fastDrone', count: 8, interval: 1.0 }] },
     // W22: fast JR rush
-    { groups: [{ type: 'fastDrone_jr', count: 12, interval: 0.6 }, { type: 'bomber', count: 4, interval: 3.0 }, { type: 'stealthDrone', count: 5, interval: 2.0 }] },
+    { groups: [{ type: 'fastDrone_jr', count: 16, interval: 0.5 }, { type: 'bomber', count: 6, interval: 2.5 }, { type: 'stealthDrone', count: 8, interval: 1.5 }, { type: 'scoutDrone_jr', count: 10, interval: 0.6 }] },
     // W23: heavy JR + regulars
-    { groups: [{ type: 'heavyDrone_jr', count: 3, interval: 4.0 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'scoutDrone_jr', count: 8, interval: 1.0 }] },
+    { groups: [{ type: 'heavyDrone_jr', count: 5, interval: 3.0 }, { type: 'heavyDrone', count: 6, interval: 2.5 }, { type: 'scoutDrone_jr', count: 14, interval: 0.6 }] },
     // W24: bomber JR assault
-    { groups: [{ type: 'bomber_jr', count: 6, interval: 2.0 }, { type: 'fastDrone_jr', count: 8, interval: 0.8 }, { type: 'stealthDrone', count: 6, interval: 1.5 }] },
+    { groups: [{ type: 'bomber_jr', count: 8, interval: 1.5 }, { type: 'fastDrone_jr', count: 12, interval: 0.6 }, { type: 'stealthDrone', count: 8, interval: 1.2 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W25: BOSS + JR full mix
-    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'scoutDrone_jr', count: 8, interval: 1.0 }, { type: 'bomber_jr', count: 4, interval: 2.5 }, { type: 'heavyDrone_jr', count: 3, interval: 3.0 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'scoutDrone_jr', count: 12, interval: 0.8 }, { type: 'bomber_jr', count: 6, interval: 2.0 }, { type: 'heavyDrone_jr', count: 5, interval: 2.5 }, { type: 'fastDrone_jr', count: 8, interval: 0.8 }] },
     // W26+: late-game templates (cycle with scaling)
-    { groups: [{ type: 'fastDrone_jr', count: 15, interval: 0.5 }, { type: 'bomber_jr', count: 8, interval: 1.5 }, { type: 'heavyDrone', count: 5, interval: 2.5 }] },
-    { groups: [{ type: 'scoutDrone_jr', count: 15, interval: 0.4 }, { type: 'stealthDrone', count: 10, interval: 1.0 }, { type: 'bomber', count: 6, interval: 2.0 }] },
-    { groups: [{ type: 'heavyDrone_jr', count: 6, interval: 2.0 }, { type: 'fastDrone_jr', count: 12, interval: 0.6 }, { type: 'bomber_jr', count: 6, interval: 1.8 }] },
+    { groups: [{ type: 'fastDrone_jr', count: 20, interval: 0.4 }, { type: 'bomber_jr', count: 10, interval: 1.2 }, { type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'scoutDrone', count: 15, interval: 0.4 }] },
+    { groups: [{ type: 'scoutDrone_jr', count: 20, interval: 0.3 }, { type: 'stealthDrone', count: 14, interval: 0.8 }, { type: 'bomber', count: 8, interval: 1.5 }, { type: 'heavyDrone_jr', count: 5, interval: 2.5 }] },
+    { groups: [{ type: 'heavyDrone_jr', count: 8, interval: 1.5 }, { type: 'fastDrone_jr', count: 18, interval: 0.4 }, { type: 'bomber_jr', count: 8, interval: 1.5 }, { type: 'scoutDrone_jr', count: 15, interval: 0.4 }] },
   ];
 }
 const WAVES = genWaves();
@@ -2627,7 +2633,7 @@ function rr(c, x, y, w, h, r) {
 function startGame() {
   G.phase = 'playing';
   G.ship.hp = G.ship.maxHp;
-  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 4 };
+  G.res = { iron: 10, gunpowder: 5, electronics: 1, brass: 1 };
   initSlots();
   placeTurret(0, 'machineGun'); // bow
   placeTurret(7, 'machineGun'); // stern
@@ -2642,7 +2648,7 @@ function resetGame() {
   G.dmgFlash = 0; shakeAmt = 0;
   particles.length = 0;
   G.ship.hp = G.ship.maxHp;
-  G.res = { iron: 25, gunpowder: 12, electronics: 3, brass: 4 };
+  G.res = { iron: 10, gunpowder: 5, electronics: 1, brass: 1 };
   initSlots();
   placeTurret(0, 'machineGun');
   placeTurret(7, 'machineGun');
