@@ -381,6 +381,38 @@ const ENEMY_DEFS = {
     color: '#4488aa', drop: { electronics: 8, brass: 3 },
     behavior: 'strafe', strafeOffset: 80, stealth: true,
   },
+  // ── Jammer-Resistant variants (W20+) ──
+  scoutDrone_jr: {
+    name: '耐妨偵察機', hp: 45, speed: 85, torpedoDmg: 14, score: 18, size: 10,
+    color: '#ccaa33', drop: { iron: 4, gunpowder: 2, brass: 2 },
+    behavior: 'orbit', orbits: 2, orbitRadius: 180,
+    jammerResist: 0.8,
+  },
+  fastDrone_jr: {
+    name: '耐妨高速機', hp: 30, speed: 135, torpedoDmg: 17, score: 25, size: 9,
+    color: '#ddbb44', drop: { iron: 3, electronics: 3, brass: 2 },
+    behavior: 'strafe', strafeOffset: 100,
+    jammerResist: 0.85,
+  },
+  bomber_jr: {
+    name: '耐妨爆撃機', hp: 140, speed: 55, torpedoDmg: 45, score: 50, size: 18,
+    color: '#bb9933', drop: { iron: 10, gunpowder: 6, brass: 4 },
+    behavior: 'orbit', orbits: 1, orbitRadius: 140,
+    jammerResist: 0.9,
+  },
+  heavyDrone_jr: {
+    name: '耐妨重装機', hp: 240, speed: 42, torpedoDmg: 55, score: 70, size: 22,
+    color: '#aa8822', drop: { iron: 15, gunpowder: 10, electronics: 6, brass: 3 },
+    behavior: 'orbit', orbits: 2, orbitRadius: 120,
+    jammerResist: 0.9,
+  },
+  // ── Boss enemy (W5, 10, 15, 20...) ──
+  boss: {
+    name: 'ドレッドノート', hp: 800, speed: 30, torpedoDmg: 80, score: 200, size: 32,
+    color: '#eeeeee', drop: { iron: 30, gunpowder: 20, electronics: 15, brass: 10 },
+    behavior: 'orbit', orbits: 3, orbitRadius: 160,
+    isBoss: true,
+  },
 };
 
 // ─── GAME STATE ─────────────────────────────────────────
@@ -537,6 +569,8 @@ function spawnEnemy(type) {
     stealth: def.stealth || false,
     stealthAlpha: def.stealth ? 0.15 : 1.0,
     slowTimer: 0, slowFactor: 1.0,
+    jammerResist: def.jammerResist || 0,
+    isBoss: def.isBoss || false,
     hitFlash: 0,
     angle: ang(ex, ey, G.ship.x, G.ship.y), // facing ship
     // Flight behavior state
@@ -553,28 +587,33 @@ function spawnEnemy(type) {
     torpedoDropped: false,
     retreatAngle: 0,
     threatLevel: 0, // 0=safe, 1=about to fire
+    bossLabel: def.isBoss ? 'BOSS' : null,
   };
   G.enemies.push(enemy);
 }
 
 // ─── TORPEDO (enemy attack) ─────────────────────────────
 function dropTorpedo(enemy) {
-  const tgtX = G.ship.x + rand(-30, 30);
-  const tgtY = G.ship.y + rand(-15, 15);
-  // Torpedo speed: slow and menacing (gives player time to shoot it down)
-  // Damage-based scaling: heavier enemies launch slightly faster torpedoes
-  const baseTorpSpeed = enemy.torpedoDmg >= 40 ? 110 : 90;
-  G.torpedoes.push({
-    x: enemy.x, y: enemy.y,
-    tx: tgtX, ty: tgtY,
-    speed: baseTorpSpeed,
-    damage: enemy.torpedoDmg,
-    hp: enemy.torpedoDmg >= 40 ? 30 : 15, // shootable! heavier torpedoes take more hits
-    maxHp: enemy.torpedoDmg >= 40 ? 30 : 15,
-    life: 6.0, // longer life since slower
-    trail: [],
-    hitFlash: 0,
-  });
+  // Boss fires a spread of 3 torpedoes
+  const torpCount = enemy.isBoss ? 3 : 1;
+  for (let i = 0; i < torpCount; i++) {
+    const spread = enemy.isBoss ? (i - 1) * 40 : 0; // -40, 0, +40
+    const tgtX = G.ship.x + rand(-30, 30) + spread;
+    const tgtY = G.ship.y + rand(-15, 15);
+    const baseTorpSpeed = enemy.torpedoDmg >= 40 ? 110 : 90;
+    const torpHp = enemy.isBoss ? 50 : (enemy.torpedoDmg >= 40 ? 30 : 15);
+    G.torpedoes.push({
+      x: enemy.x, y: enemy.y,
+      tx: tgtX, ty: tgtY,
+      speed: baseTorpSpeed,
+      damage: enemy.isBoss ? Math.round(enemy.torpedoDmg / torpCount) : enemy.torpedoDmg,
+      hp: torpHp,
+      maxHp: torpHp,
+      life: 6.0,
+      trail: [],
+      hitFlash: 0,
+    });
+  }
   sfx('torpedo');
   enemy.torpedoDropped = true;
 }
@@ -611,26 +650,60 @@ function spawnScrap(x, y, resources) {
 // ─── WAVES ──────────────────────────────────────────────
 function genWaves() {
   return [
-    // W1: gentle intro — few slow drones orbit lazily
+    // W1: gentle intro
     { groups: [{ type: 'scoutDrone', count: 6, interval: 1.8 }] },
     // W2: more scouts
     { groups: [{ type: 'scoutDrone', count: 10, interval: 1.2 }] },
-    // W3: scouts + fast strafers from multiple sides
+    // W3: scouts + fast strafers
     { groups: [{ type: 'scoutDrone', count: 8, interval: 1.5 }, { type: 'fastDrone', count: 4, interval: 2.5 }] },
-    // W4: fast drone swarm — need spread fire
+    // W4: fast drone swarm
     { groups: [{ type: 'fastDrone', count: 12, interval: 0.8 }] },
-    // W5: bombers appear — need focus fire on these
-    { groups: [{ type: 'scoutDrone', count: 8, interval: 1.2 }, { type: 'bomber', count: 2, interval: 5.0 }] },
-    // W6: mixed
-    { groups: [{ type: 'fastDrone', count: 10, interval: 0.9 }, { type: 'bomber', count: 4, interval: 3.0 }] },
+    // W5: BOSS + escorts
+    { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'scoutDrone', count: 6, interval: 1.5 }] },
+    // W6: bombers intro
+    { groups: [{ type: 'fastDrone', count: 10, interval: 0.9 }, { type: 'bomber', count: 3, interval: 3.5 }] },
     // W7: heavy drones
     { groups: [{ type: 'heavyDrone', count: 3, interval: 4.0 }, { type: 'scoutDrone', count: 12, interval: 0.8 }] },
-    // W8: stealth + bombers — chaos
+    // W8: stealth + bombers
     { groups: [{ type: 'stealthDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }] },
-    // W9: everything
+    // W9: everything ramp
     { groups: [{ type: 'fastDrone', count: 15, interval: 0.5 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'bomber', count: 4, interval: 2.5 }] },
-    // W10: boss rush
-    { groups: [{ type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'stealthDrone', count: 6, interval: 2.0 }, { type: 'bomber', count: 6, interval: 2.0 }] },
+    // W10: BOSS + heavy escorts
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'bomber', count: 4, interval: 2.5 }] },
+    // W11: stealth swarm
+    { groups: [{ type: 'stealthDrone', count: 10, interval: 1.2 }, { type: 'fastDrone', count: 8, interval: 1.0 }] },
+    // W12: bomber wave
+    { groups: [{ type: 'bomber', count: 8, interval: 2.0 }, { type: 'scoutDrone', count: 10, interval: 0.8 }] },
+    // W13: heavy + stealth combo
+    { groups: [{ type: 'heavyDrone', count: 6, interval: 2.5 }, { type: 'stealthDrone', count: 8, interval: 1.5 }] },
+    // W14: everything dense
+    { groups: [{ type: 'scoutDrone', count: 15, interval: 0.5 }, { type: 'bomber', count: 6, interval: 2.0 }, { type: 'heavyDrone', count: 3, interval: 3.5 }] },
+    // W15: BOSS + full mix
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'fastDrone', count: 12, interval: 0.7 }, { type: 'bomber', count: 5, interval: 2.5 }, { type: 'stealthDrone', count: 4, interval: 3.0 }] },
+    // W16: fast chaos
+    { groups: [{ type: 'fastDrone', count: 20, interval: 0.4 }, { type: 'bomber', count: 3, interval: 4.0 }] },
+    // W17: stealth bombers
+    { groups: [{ type: 'stealthDrone', count: 12, interval: 1.0 }, { type: 'bomber', count: 8, interval: 1.8 }] },
+    // W18: heavy assault
+    { groups: [{ type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'fastDrone', count: 10, interval: 0.8 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
+    // W19: calm before storm
+    { groups: [{ type: 'scoutDrone', count: 20, interval: 0.3 }, { type: 'stealthDrone', count: 8, interval: 1.5 }] },
+    // W20: BOSS + jammer-resist debut!
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'scoutDrone_jr', count: 6, interval: 2.0 }, { type: 'fastDrone_jr', count: 4, interval: 2.5 }, { type: 'bomber', count: 4, interval: 3.0 }] },
+    // W21: jammer-resist scouts mix
+    { groups: [{ type: 'scoutDrone_jr', count: 10, interval: 1.0 }, { type: 'scoutDrone', count: 10, interval: 0.8 }, { type: 'fastDrone', count: 6, interval: 1.2 }] },
+    // W22: fast JR rush
+    { groups: [{ type: 'fastDrone_jr', count: 12, interval: 0.6 }, { type: 'bomber', count: 4, interval: 3.0 }, { type: 'stealthDrone', count: 5, interval: 2.0 }] },
+    // W23: heavy JR + regulars
+    { groups: [{ type: 'heavyDrone_jr', count: 3, interval: 4.0 }, { type: 'heavyDrone', count: 4, interval: 3.0 }, { type: 'scoutDrone_jr', count: 8, interval: 1.0 }] },
+    // W24: bomber JR assault
+    { groups: [{ type: 'bomber_jr', count: 6, interval: 2.0 }, { type: 'fastDrone_jr', count: 8, interval: 0.8 }, { type: 'stealthDrone', count: 6, interval: 1.5 }] },
+    // W25: BOSS + JR full mix
+    { groups: [{ type: 'boss', count: 1, interval: 2.0 }, { type: 'scoutDrone_jr', count: 8, interval: 1.0 }, { type: 'bomber_jr', count: 4, interval: 2.5 }, { type: 'heavyDrone_jr', count: 3, interval: 3.0 }] },
+    // W26+: late-game templates (cycle with scaling)
+    { groups: [{ type: 'fastDrone_jr', count: 15, interval: 0.5 }, { type: 'bomber_jr', count: 8, interval: 1.5 }, { type: 'heavyDrone', count: 5, interval: 2.5 }] },
+    { groups: [{ type: 'scoutDrone_jr', count: 15, interval: 0.4 }, { type: 'stealthDrone', count: 10, interval: 1.0 }, { type: 'bomber', count: 6, interval: 2.0 }] },
+    { groups: [{ type: 'heavyDrone_jr', count: 6, interval: 2.0 }, { type: 'fastDrone_jr', count: 12, interval: 0.6 }, { type: 'bomber_jr', count: 6, interval: 1.8 }] },
   ];
 }
 const WAVES = genWaves();
@@ -641,16 +714,32 @@ function startWave(idx) {
   G.spawnQueues = [];
   const w = WAVES[Math.min(idx, WAVES.length - 1)];
   const scale = idx >= WAVES.length ? 1 + (idx - WAVES.length + 1) * 0.3 : 1;
-  // HP scales with wave index: enemies get tougher each wave
-  // Gentle early, steeper later (wave 0=1x, wave 3=1.3x, wave 6=1.6x, wave 9=2.0x)
+  // HP scales with wave index
   G.waveHpScale = 1 + idx * 0.1;
-  for (const g of w.groups) {
+
+  // Build spawn queues from wave definition
+  const groups = [...w.groups];
+
+  // Inject boss on every 5th wave if not already in wave def
+  const waveNum = idx + 1; // 1-indexed for display
+  const isBossWave = waveNum % 5 === 0 && waveNum > 0;
+  if (isBossWave && !groups.some(g => g.type === 'boss')) {
+    groups.unshift({ type: 'boss', count: 1, interval: 2.0 });
+  }
+
+  for (const g of groups) {
     G.spawnQueues.push({
       type: g.type, remaining: Math.ceil(g.count * scale),
       interval: g.interval / Math.sqrt(scale), timer: rand(0.2, 1.0),
     });
   }
-  G.announce = { text: `WAVE ${idx + 1}`, timer: 2.5 };
+
+  // Boss announcement
+  if (isBossWave || groups.some(g => g.type === 'boss')) {
+    G.announce = { text: `⚠ WAVE ${waveNum} — BOSS`, timer: 3.0 };
+  } else {
+    G.announce = { text: `WAVE ${waveNum}`, timer: 2.5 };
+  }
   sfx('wave');
 }
 
@@ -1063,8 +1152,14 @@ function updateTurretFiring(dt) {
         for (const e of G.enemies) {
           const d = dist(wx, wy, e.x, e.y);
           if (d < range) {
-            e.slowFactor = def.slowFactor;
-            e.slowTimer = def.slowDuration;
+            // Jammer resistance: reduce slow effectiveness
+            const resist = e.jammerResist || 0;
+            const effectiveSlow = lerp(def.slowFactor, 1.0, resist);
+            const effectiveDuration = def.slowDuration * (1 - resist);
+            if (effectiveDuration > 0.2) { // skip if almost fully resisted
+              e.slowFactor = effectiveSlow;
+              e.slowTimer = effectiveDuration;
+            }
             hit = true;
           }
         }
@@ -1612,7 +1707,30 @@ function renderEnemies() {
       ctx.fillStyle = col; // restore body color
     }
 
-    if (e.type === 'bomber' || e.type === 'heavyDrone') {
+    if (e.isBoss) {
+      // Boss: large hexagonal shape with armor plates
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = i * TAU / 6 - PI / 6;
+        const px = Math.cos(a) * sz, py = Math.sin(a) * sz;
+        i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      }
+      ctx.closePath(); ctx.fill();
+      // Inner armor ring
+      ctx.strokeStyle = e.hitFlash > 0 ? '#fff' : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, sz * 0.6, 0, TAU); ctx.stroke();
+      // Core
+      ctx.fillStyle = e.hitFlash > 0 ? '#fff' : `rgba(255,${Math.round(180 - threat * 140)},${Math.round(80 - threat * 60)},0.8)`;
+      ctx.beginPath(); ctx.arc(0, 0, sz * 0.3, 0, TAU); ctx.fill();
+      // Rotating armor segments
+      const ra = G.time * 0.8;
+      ctx.strokeStyle = `rgba(255,255,255,${0.15 + threat * 0.2})`; ctx.lineWidth = 1.5;
+      for (let i = 0; i < 3; i++) {
+        const sa = ra + i * TAU / 3;
+        ctx.beginPath(); ctx.arc(0, 0, sz * 0.8, sa, sa + 0.8); ctx.stroke();
+      }
+    } else if (e.type === 'bomber' || e.type === 'heavyDrone' || e.type === 'bomber_jr' || e.type === 'heavyDrone_jr') {
       ctx.beginPath();
       ctx.moveTo(sz, 0); ctx.lineTo(-sz * 0.5, -sz * 0.8);
       ctx.lineTo(-sz, 0); ctx.lineTo(-sz * 0.5, sz * 0.8); ctx.closePath(); ctx.fill();
@@ -1633,6 +1751,16 @@ function renderEnemies() {
       for (const py of [-sz * 0.5, sz * 0.5]) {
         ctx.beginPath(); ctx.arc(-sz * 0.2, py, sz * 0.3, pa, pa + PI); ctx.stroke();
       }
+    }
+
+    // Jammer-resist shield indicator (golden ring with shield icon)
+    if (e.jammerResist > 0) {
+      const shPulse = (Math.sin(G.time * 3) + 1) * 0.5;
+      ctx.strokeStyle = `rgba(204,170,51,${0.35 + shPulse * 0.25})`;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.arc(0, 0, sz + 5, 0, TAU); ctx.stroke();
+      ctx.setLineDash([]);
     }
 
     // Warning icon at high threat
@@ -1660,11 +1788,32 @@ function renderEnemies() {
 
     ctx.restore();
 
-    // HP bar for tough enemies
-    if (e.maxHp > 50 && e.hp < e.maxHp) {
-      const bw = e.size * 2, bh = 2;
-      ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(e.x - bw / 2, e.y - e.size - 6, bw, bh);
-      ctx.fillStyle = '#ff4466'; ctx.fillRect(e.x - bw / 2, e.y - e.size - 6, bw * (e.hp / e.maxHp), bh);
+    // HP bar for tough enemies (always visible for bosses)
+    if (e.isBoss || (e.maxHp > 50 && e.hp < e.maxHp)) {
+      const bw = e.isBoss ? e.size * 3 : e.size * 2;
+      const bh = e.isBoss ? 4 : 2;
+      const by = e.y - e.size - (e.isBoss ? 12 : 6);
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(e.x - bw / 2, by, bw, bh);
+      const hpCol = e.isBoss ? '#ffcc44' : '#ff4466';
+      ctx.fillStyle = hpCol; ctx.fillRect(e.x - bw / 2, by, bw * (e.hp / e.maxHp), bh);
+      if (e.isBoss) {
+        ctx.strokeStyle = 'rgba(255,204,68,0.4)'; ctx.lineWidth = 0.5;
+        ctx.strokeRect(e.x - bw / 2, by, bw, bh);
+      }
+    }
+
+    // Boss label
+    if (e.isBoss) {
+      ctx.font = "bold 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#ffcc44';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+      ctx.fillText('BOSS', e.x, e.y - e.size - 14);
+    }
+
+    // Jammer-resist indicator label
+    if (e.jammerResist > 0 && !e.isBoss) {
+      ctx.font = "bold 7px sans-serif"; ctx.fillStyle = 'rgba(204,170,51,0.7)';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+      ctx.fillText('◈', e.x, e.y - e.size - (e.maxHp > 50 && e.hp < e.maxHp ? 9 : 3));
     }
   }
 }
