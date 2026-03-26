@@ -59,6 +59,7 @@ canvas.addEventListener('pointerdown', e => {
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, startTime: Date.now() });
   if (!audioCtx) initAudio();
   if (G.phase === 'title') { startGame(); return; }
+  if (G.phase === 'sinking') return; // block input during sinking
   if (G.phase === 'gameover') { resetGame(); return; }
 });
 canvas.addEventListener('pointermove', e => {
@@ -417,7 +418,7 @@ const ENEMY_DEFS = {
 
 // ─── GAME STATE ─────────────────────────────────────────
 const G = {
-  phase: 'title', // title | playing | building | gameover
+  phase: 'title', // title | playing | building | sinking | gameover
   time: 0,
   wave: 0,
   score: 0,
@@ -595,7 +596,93 @@ function spawnEnemy(type) {
     threatLevel: 0, // 0=safe, 1=about to fire
     bossLabel: def.isBoss ? 'BOSS' : null,
   };
+
+  // Boss phase shield system
+  if (def.isBoss) {
+    const shieldHp = Math.round(scaledHp * 0.3); // each shield = 30% of boss HP
+    enemy.shields = [
+      { hp: shieldHp, maxHp: shieldHp, color: '#4488ff', label: 'PHASE 1' }, // blue
+      { hp: shieldHp, maxHp: shieldHp, color: '#44cc66', label: 'PHASE 2' }, // green
+      { hp: shieldHp, maxHp: shieldHp, color: '#ddbb33', label: 'PHASE 3' }, // yellow
+    ];
+    enemy.shieldIdx = 0;        // current shield being damaged
+    enemy.phaseAttackTimer = 0; // timer until forced attack
+    enemy.phaseAttackInterval = 12; // seconds to break each shield
+    enemy.phaseBreakFlash = 0;  // visual feedback on shield break
+    enemy.totalShieldHp = shieldHp * 3;
+  }
+
   G.enemies.push(enemy);
+}
+
+// ─── BOSS PHASE DAMAGE SYSTEM ───────────────────────────
+function applyDamageToEnemy(e, dmg) {
+  if (e.shields && e.shieldIdx < e.shields.length) {
+    // Damage current shield first
+    const shield = e.shields[e.shieldIdx];
+    const absorbed = Math.min(shield.hp, dmg);
+    shield.hp -= absorbed;
+    dmg -= absorbed;
+    if (shield.hp <= 0) {
+      // Shield broken! Reset attack timer, spawn reinforcements
+      e.shieldIdx++;
+      e.phaseAttackTimer = 0;
+      e.phaseBreakFlash = 1.0;
+      sfx('explode');
+      addShake(4);
+      // Spawn reinforcement enemies on shield break
+      const waveNum = (G.wave || 0) + 1;
+      const reinforceTypes = waveNum >= 20
+        ? ['scoutDrone_jr', 'scoutDrone_jr', 'fastDrone_jr']
+        : ['scoutDrone', 'scoutDrone', 'fastDrone'];
+      for (const rType of reinforceTypes) {
+        spawnEnemy(rType);
+      }
+      // Visual burst
+      emitP(e.x, e.y, 30, {
+        colors: [shield.color, '#ffffff'],
+        spdMin: 80, spdMax: 250, szMin: 3, szMax: 8,
+        lifeMin: 0.3, lifeMax: 0.8, type: 'spark',
+      });
+      // Announce — no phase labels, just short feedback
+      if (e.shieldIdx < e.shields.length) {
+        G.announce = { text: '◆ SHIELD BREAK', timer: 1.5 };
+      } else {
+        G.announce = { text: '☢ CORE EXPOSED', timer: 2.0 };
+      }
+    }
+  }
+  // Remaining damage goes to HP
+  if (dmg > 0) e.hp -= dmg;
+}
+
+function updateBossPhase(e, dt) {
+  if (!e.shields) return;
+  if (e.phaseBreakFlash > 0) e.phaseBreakFlash -= dt * 2;
+  if (e.shieldIdx >= e.shields.length) return; // all shields broken, core exposed
+
+  // Timer counts up; if it reaches interval, boss fires a punishing torpedo barrage
+  e.phaseAttackTimer += dt;
+  if (e.phaseAttackTimer >= e.phaseAttackInterval) {
+    e.phaseAttackTimer = 0;
+    // Punishing attack: fire 5 spread torpedoes
+    for (let i = 0; i < 5; i++) {
+      const spread = (i - 2) * 50;
+      const tgtX = G.ship.x + spread + rand(-20, 20);
+      const tgtY = G.ship.y + rand(-15, 15);
+      G.torpedoes.push({
+        x: e.x, y: e.y,
+        tx: tgtX, ty: tgtY,
+        speed: 100,
+        damage: Math.round(e.torpedoDmg / 3),
+        hp: 25, maxHp: 25,
+        life: 6.0, trail: [], hitFlash: 0,
+      });
+    }
+    sfx('torpedo');
+    addShake(5);
+    G.announce = { text: '⚠ BOSS BARRAGE!', timer: 1.5 };
+  }
 }
 
 // ─── TORPEDO (enemy attack) ─────────────────────────────
@@ -606,7 +693,8 @@ function dropTorpedo(enemy) {
     const spread = enemy.isBoss ? (i - 1) * 40 : 0; // -40, 0, +40
     const tgtX = G.ship.x + rand(-30, 30) + spread;
     const tgtY = G.ship.y + rand(-15, 15);
-    const baseTorpSpeed = enemy.torpedoDmg >= 40 ? 110 : 90;
+    // Slow torpedoes for interception window; heavier torpedoes faster
+    const baseTorpSpeed = enemy.isBoss ? 100 : (enemy.torpedoDmg >= 40 ? 90 : 55);
     // Normal torpedo: 1 MG bullet kill; heavy (bomber): 1 burst; boss: tough
     const torpHp = enemy.isBoss ? 25 : (enemy.torpedoDmg >= 40 ? 15 : 4);
     G.torpedoes.push({
@@ -666,7 +754,7 @@ function genWaves() {
     // W4: fast drone swarm
     { groups: [{ type: 'fastDrone', count: 12, interval: 0.8 }] },
     // W5: BOSS + escorts
-    { groups: [{ type: 'boss', count: 2, interval: 3.0 }, { type: 'scoutDrone', count: 6, interval: 1.5 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'scoutDrone', count: 6, interval: 1.5 }] },
     // W6: bombers intro — more scouts flooding in
     { groups: [{ type: 'fastDrone', count: 14, interval: 0.7 }, { type: 'bomber', count: 4, interval: 3.0 }, { type: 'scoutDrone', count: 8, interval: 0.9 }] },
     // W7: heavy drones + scout swarm
@@ -676,7 +764,7 @@ function genWaves() {
     // W9: everything ramp — dense
     { groups: [{ type: 'fastDrone', count: 18, interval: 0.4 }, { type: 'heavyDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W10: BOSS + heavy escorts
-    { groups: [{ type: 'boss', count: 2, interval: 3.0 }, { type: 'heavyDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'heavyDrone', count: 5, interval: 2.5 }, { type: 'bomber', count: 5, interval: 2.0 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
     // W11: stealth swarm + orbit wall
     { groups: [{ type: 'stealthDrone', count: 12, interval: 1.0 }, { type: 'fastDrone', count: 10, interval: 0.8 }, { type: 'scoutDrone', count: 14, interval: 0.5 }] },
     // W12: bomber wave + scout flood
@@ -686,7 +774,7 @@ function genWaves() {
     // W14: everything dense
     { groups: [{ type: 'scoutDrone', count: 22, interval: 0.3 }, { type: 'bomber', count: 8, interval: 1.5 }, { type: 'heavyDrone', count: 5, interval: 2.5 }] },
     // W15: BOSS + full mix
-    { groups: [{ type: 'boss', count: 2, interval: 3.0 }, { type: 'fastDrone', count: 15, interval: 0.5 }, { type: 'bomber', count: 7, interval: 2.0 }, { type: 'stealthDrone', count: 6, interval: 2.5 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'fastDrone', count: 15, interval: 0.5 }, { type: 'bomber', count: 7, interval: 2.0 }, { type: 'stealthDrone', count: 6, interval: 2.5 }, { type: 'scoutDrone', count: 10, interval: 0.6 }] },
     // W16: fast chaos
     { groups: [{ type: 'fastDrone', count: 25, interval: 0.3 }, { type: 'bomber', count: 5, interval: 3.0 }, { type: 'scoutDrone', count: 15, interval: 0.4 }] },
     // W17: stealth bombers
@@ -696,7 +784,7 @@ function genWaves() {
     // W19: calm before storm — scout flood
     { groups: [{ type: 'scoutDrone', count: 30, interval: 0.2 }, { type: 'stealthDrone', count: 10, interval: 1.2 }] },
     // W20: BOSS + jammer-resist debut!
-    { groups: [{ type: 'boss', count: 2, interval: 3.0 }, { type: 'scoutDrone_jr', count: 10, interval: 1.5 }, { type: 'fastDrone_jr', count: 6, interval: 2.0 }, { type: 'bomber', count: 6, interval: 2.5 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'scoutDrone_jr', count: 10, interval: 1.5 }, { type: 'fastDrone_jr', count: 6, interval: 2.0 }, { type: 'bomber', count: 6, interval: 2.5 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W21: jammer-resist scouts mix
     { groups: [{ type: 'scoutDrone_jr', count: 14, interval: 0.7 }, { type: 'scoutDrone', count: 16, interval: 0.5 }, { type: 'fastDrone', count: 8, interval: 1.0 }] },
     // W22: fast JR rush
@@ -706,7 +794,7 @@ function genWaves() {
     // W24: bomber JR assault
     { groups: [{ type: 'bomber_jr', count: 8, interval: 1.5 }, { type: 'fastDrone_jr', count: 12, interval: 0.6 }, { type: 'stealthDrone', count: 8, interval: 1.2 }, { type: 'scoutDrone', count: 12, interval: 0.5 }] },
     // W25: BOSS + JR full mix
-    { groups: [{ type: 'boss', count: 2, interval: 3.0 }, { type: 'scoutDrone_jr', count: 12, interval: 0.8 }, { type: 'bomber_jr', count: 6, interval: 2.0 }, { type: 'heavyDrone_jr', count: 5, interval: 2.5 }, { type: 'fastDrone_jr', count: 8, interval: 0.8 }] },
+    { groups: [{ type: 'boss', count: 1, interval: 3.0 }, { type: 'scoutDrone_jr', count: 12, interval: 0.8 }, { type: 'bomber_jr', count: 6, interval: 2.0 }, { type: 'heavyDrone_jr', count: 5, interval: 2.5 }, { type: 'fastDrone_jr', count: 8, interval: 0.8 }] },
     // W26+: late-game templates (cycle with scaling)
     { groups: [{ type: 'fastDrone_jr', count: 20, interval: 0.4 }, { type: 'bomber_jr', count: 10, interval: 1.2 }, { type: 'heavyDrone', count: 8, interval: 2.0 }, { type: 'scoutDrone', count: 15, interval: 0.4 }] },
     { groups: [{ type: 'scoutDrone_jr', count: 20, interval: 0.3 }, { type: 'stealthDrone', count: 14, interval: 0.8 }, { type: 'bomber', count: 8, interval: 1.5 }, { type: 'heavyDrone_jr', count: 5, interval: 2.5 }] },
@@ -731,7 +819,7 @@ function startWave(idx) {
   const waveNum = idx + 1; // 1-indexed for display
   const isBossWave = waveNum % 5 === 0 && waveNum > 0;
   if (isBossWave && !groups.some(g => g.type === 'boss')) {
-    groups.unshift({ type: 'boss', count: 2, interval: 3.0 });
+    groups.unshift({ type: 'boss', count: 1, interval: 3.0 });
   }
 
   for (const g of groups) {
@@ -753,35 +841,161 @@ function startWave(idx) {
 // ─── MAIN UPDATE ────────────────────────────────────────
 function update(dt) {
   G.time += dt;
-  if (G.phase === 'title' || G.phase === 'gameover') return;
+  if (G.phase === 'title') return;
+  // During gameover, only update particles (smoke/fire continues behind overlay)
+  if (G.phase === 'gameover') {
+    updateParticles(dt);
+    return;
+  }
   if (G.phase === 'building') {
     updateScraps(dt);
     updateParticles(dt); updateShake();
     return;
   }
 
-  // === PLAYING ===
-  updateSpawns(dt);
-  updateEnemyAI(dt);
-  updateTurretAiming(dt);
-  updateTurretFiring(dt);
-  updateBullets(dt);
+  // === PLAYING / SINKING ===
+  const isSinking = G.phase === 'sinking';
+  if (!isSinking) {
+    updateSpawns(dt);
+    updateEnemyAI(dt);
+    updateTurretAiming(dt);
+    updateTurretFiring(dt);
+    updateBullets(dt);
+  }
   updateTorpedoes(dt);
   updateScraps(dt);
   updateParticles(dt);
   updateShake();
   if (G.dmgFlash > 0) G.dmgFlash -= dt;
 
-  // Check ship death
+  // Check ship death — enter sinking phase
   if (G.ship.hp <= 0 && G.phase === 'playing') {
-    G.phase = 'gameover';
-    addShake(12);
+    G.phase = 'sinking';
+    G.sink = {
+      timer: 0,           // seconds since death
+      duration: 5.0,      // total sinking time before game over
+      tilt: 0,            // roll angle (radians)
+      yOffset: 0,         // how far ship has sunk
+      opacity: 1.0,       // ship fade
+      fireTimer: 0,       // fire particle timer
+      smokeTimer: 0,      // smoke particle timer
+      bubbleTimer: 0,     // bubble timer
+      phase: 'explode',   // explode -> burn -> submerge
+    };
+    addShake(15);
     sfx('explode');
-    emitP(G.ship.x, G.ship.y, 120, {
+    G.announce = { text: '✦ 大 破 ✦', timer: 2.5 };
+    // Big initial explosion
+    emitP(G.ship.x, G.ship.y, 150, {
       colors: ['#ff4444', '#ff8844', '#ffcc44', '#333', '#111'],
       spdMin: 40, spdMax: 400, szMin: 3, szMax: 14,
       lifeMin: 0.5, lifeMax: 2.5, type: 'debris',
     });
+    emitP(G.ship.x, G.ship.y, 60, {
+      colors: ['#ffcc44', '#fff', '#ff8844'],
+      spdMin: 80, spdMax: 300, szMin: 2, szMax: 6,
+      lifeMin: 0.2, lifeMax: 0.8, type: 'spark',
+    });
+  }
+
+  // Sinking phase update
+  if (G.phase === 'sinking' && G.sink) {
+    const sk = G.sink;
+    sk.timer += dt;
+
+    // Phase transitions
+    if (sk.timer < 1.0) {
+      sk.phase = 'explode';
+    } else if (sk.timer < 3.0) {
+      sk.phase = 'burn';
+    } else {
+      sk.phase = 'submerge';
+    }
+
+    // Tilt: slowly roll to starboard
+    const maxTilt = 0.25; // ~14 degrees
+    sk.tilt = Math.min(sk.timer * 0.06, maxTilt);
+
+    // Sink: accelerating downward (moderate pace so ship stays visible)
+    const sinkSpeed = sk.timer < 1.5 ? 5 : 5 + (sk.timer - 1.5) * 14;
+    sk.yOffset += sinkSpeed * dt;
+
+    // Fade near the end — keep minimum visible for gameover background
+    if (sk.timer > 3.5) {
+      sk.opacity = Math.max(0.15, 1.0 - (sk.timer - 3.5) / 1.5);
+    }
+
+    // Fire particles during burn phase
+    sk.fireTimer += dt;
+    if (sk.phase === 'explode' || sk.phase === 'burn') {
+      if (sk.fireTimer > 0.06) {
+        sk.fireTimer = 0;
+        const fx = G.ship.x + rand(-40, 30);
+        const fy = G.ship.y + sk.yOffset + rand(-12, 8);
+        emitP(fx, fy, rand(3, 8), {
+          colors: ['#ff6622', '#ff9944', '#ffcc44'],
+          spdMin: 15, spdMax: 60, szMin: 2, szMax: 6,
+          lifeMin: 0.3, lifeMax: 0.9, type: 'spark', gravity: -40,
+        });
+      }
+    }
+
+    // Smoke
+    sk.smokeTimer += dt;
+    if (sk.smokeTimer > 0.1) {
+      sk.smokeTimer = 0;
+      const sx2 = G.ship.x + rand(-35, 25);
+      const sy2 = G.ship.y + sk.yOffset + rand(-10, 5);
+      emitP(sx2, sy2, rand(2, 5), {
+        colors: ['#222', '#444', '#333'],
+        spdMin: 10, spdMax: 40, szMin: 4, szMax: 12,
+        lifeMin: 0.8, lifeMax: 2.5, gravity: -20,
+      });
+    }
+
+    // Bubbles during submerge
+    if (sk.phase === 'submerge') {
+      sk.bubbleTimer += dt;
+      if (sk.bubbleTimer > 0.08) {
+        sk.bubbleTimer = 0;
+        const bx = G.ship.x + rand(-50, 40);
+        const bubbleY = G.ship.y + sk.yOffset + rand(-5, 15);
+        emitP(bx, bubbleY, rand(1, 4), {
+          colors: ['rgba(120,180,220,0.5)', 'rgba(150,200,240,0.3)'],
+          spdMin: 15, spdMax: 50, szMin: 2, szMax: 7,
+          lifeMin: 0.4, lifeMax: 1.2, gravity: -60,
+        });
+      }
+      // Waterline foam — splash at the ship's original Y (surface)
+      if (Math.random() < 0.3) {
+        const foamX = G.ship.x + rand(-55, 45);
+        emitP(foamX, G.ship.y, rand(2, 5), {
+          colors: ['rgba(180,220,255,0.4)', 'rgba(200,240,255,0.25)', 'rgba(140,190,230,0.3)'],
+          spdMin: 8, spdMax: 35, szMin: 2, szMax: 5,
+          lifeMin: 0.3, lifeMax: 0.8, gravity: -15,
+        });
+      }
+    }
+
+    // Secondary explosions during explode phase
+    if (sk.phase === 'explode' && Math.random() < 0.15) {
+      const ex = G.ship.x + rand(-45, 35);
+      const ey = G.ship.y + sk.yOffset + rand(-15, 15);
+      emitP(ex, ey, rand(10, 25), {
+        colors: ['#ff4444', '#ff8844', '#ffcc44'],
+        spdMin: 30, spdMax: 150, szMin: 2, szMax: 8,
+        lifeMin: 0.2, lifeMax: 0.7, type: 'spark',
+      });
+      addShake(rand(2, 5));
+      sfx('explode');
+    }
+
+    // Transition to gameover
+    if (sk.timer >= sk.duration) {
+      G.phase = 'gameover';
+      G.announce = null; // clear sinking announce
+      // Keep sink data for background rendering
+    }
   }
 
   // Check wave complete
@@ -919,8 +1133,9 @@ function updateEnemyAI(dt) {
         e.y += Math.sin(e.angle) * spd * 1.3 * dt;
 
         e.phaseTimer += dt;
-        // Drop torpedo when passing close to ship (with minimum delay after strafing starts)
-        if (!e.torpedoDropped && dToShip < e.strafeOffset + 50 && e.phaseTimer > 1.5) {
+        // Drop torpedo early (distance-based) so player has interception window
+        // regardless of jammer slow. Fires when within 250px of ship.
+        if (!e.torpedoDropped && dToShip < 250 && e.phaseTimer > 0.3) {
           dropTorpedo(e);
         }
 
@@ -976,6 +1191,9 @@ function updateEnemyAI(dt) {
         break;
       }
     }
+
+    // Boss phase system
+    if (e.isBoss) updateBossPhase(e, dt);
 
     // Remove if dead
     if (e.hp <= 0) {
@@ -1267,7 +1485,7 @@ function updateBullets(dt) {
     if (!hit) {
       for (const e of G.enemies) {
         if (dist(b.x, b.y, e.x, e.y) < e.size + 4) {
-          e.hp -= b.damage;
+          applyDamageToEnemy(e, b.damage);
           e.hitFlash = 1.0;
           hit = true;
           emitP(b.x, b.y, 5, {
@@ -1279,7 +1497,7 @@ function updateBullets(dt) {
             for (const e2 of G.enemies) {
               if (e2 === e) continue;
               const d2 = dist(b.x, b.y, e2.x, e2.y);
-              if (d2 < b.aoe) { e2.hp -= b.damage * (1 - d2 / b.aoe) * 0.5; e2.hitFlash = 0.5; }
+              if (d2 < b.aoe) { applyDamageToEnemy(e2, b.damage * (1 - d2 / b.aoe) * 0.5); e2.hitFlash = 0.5; }
             }
             emitP(b.x, b.y, 20, {
               colors: ['#ff6644', '#ffaa44', '#ffdd66'],
@@ -1561,14 +1779,27 @@ function renderOcean() {
 
 function renderShip() {
   const s = G.ship;
-  ctx.save();
-  ctx.translate(s.x, s.y);
+  const sk = G.sink;
+  const sinking = (G.phase === 'sinking' || G.phase === 'gameover') && sk;
 
-  // Wake
-  ctx.fillStyle = 'rgba(150,200,255,0.025)';
-  for (let i = 0; i < 5; i++) {
-    const off = -i * 22 - 60, sp = 10 + i * 6;
-    ctx.beginPath(); ctx.moveTo(off, 0); ctx.lineTo(off - 28, -sp); ctx.lineTo(off - 28, sp); ctx.closePath(); ctx.fill();
+  ctx.save();
+
+  // Sinking transformations
+  if (sinking) {
+    ctx.globalAlpha = sk.opacity;
+    ctx.translate(s.x, s.y + sk.yOffset);
+    ctx.rotate(sk.tilt);
+  } else {
+    ctx.translate(s.x, s.y);
+  }
+
+  // Wake (hide when sinking)
+  if (!sinking) {
+    ctx.fillStyle = 'rgba(150,200,255,0.025)';
+    for (let i = 0; i < 5; i++) {
+      const off = -i * 22 - 60, sp = 10 + i * 6;
+      ctx.beginPath(); ctx.moveTo(off, 0); ctx.lineTo(off - 28, -sp); ctx.lineTo(off - 28, sp); ctx.closePath(); ctx.fill();
+    }
   }
 
   // Hull shadow
@@ -1587,10 +1818,16 @@ function renderShip() {
   ctx.fillStyle = '#5a6a7e'; ctx.fillRect(-10, -6, 20, 12);
   ctx.fillStyle = '#6a7a8e'; ctx.fillRect(-8, -5, 16, 10);
 
-  // Reactor pulse
-  const rp = 0.5 + Math.sin(G.time * 3) * 0.2;
-  ctx.fillStyle = `rgba(74,240,192,${rp * 0.25})`; ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU); ctx.fill();
-  ctx.fillStyle = `rgba(74,240,192,${rp * 0.5})`; ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.fill();
+  // Reactor pulse (disabled when sinking)
+  if (!sinking) {
+    const rp = 0.5 + Math.sin(G.time * 3) * 0.2;
+    ctx.fillStyle = `rgba(74,240,192,${rp * 0.25})`; ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU); ctx.fill();
+    ctx.fillStyle = `rgba(74,240,192,${rp * 0.5})`; ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.fill();
+  } else {
+    // Dead reactor — dim red glow
+    const rp2 = 0.2 + Math.sin(G.time * 1.5) * 0.1;
+    ctx.fillStyle = `rgba(255,60,30,${rp2 * 0.15})`; ctx.beginPath(); ctx.arc(0, 0, 6, 0, TAU); ctx.fill();
+  }
 
   // Turrets
   for (const slot of s.slots) {
@@ -1607,9 +1844,18 @@ function renderShip() {
     }
     renderTurret(slot);
   }
+
+  // Underwater wash overlay — darkening tint simulating submersion
+  if (sinking && sk.phase === 'submerge') {
+    const submergeAlpha = clamp((sk.timer - 3.0) / 2.0, 0, 0.4);
+    ctx.fillStyle = `rgba(10,25,50,${submergeAlpha})`;
+    ctx.fillRect(-s.w, -s.h, s.w * 2, s.h * 2);
+  }
+
   ctx.restore();
 
-  // Ship HP bar
+  // Ship HP bar (hide when sinking)
+  if (sinking) return; // skip HP bar when sinking
   const bw = 90, bh = 5, bx = s.x - bw / 2, by = s.y - s.h / 2 - 18;
   const hp = clamp(s.hp / s.maxHp, 0, 1);
   ctx.fillStyle = 'rgba(0,0,0,0.4)'; rr(ctx, bx, by, bw, bh, 2); ctx.fill();
@@ -1795,25 +2041,101 @@ function renderEnemies() {
 
     ctx.restore();
 
-    // HP bar for tough enemies (always visible for bosses)
-    if (e.isBoss || (e.maxHp > 50 && e.hp < e.maxHp)) {
-      const bw = e.isBoss ? e.size * 3 : e.size * 2;
-      const bh = e.isBoss ? 4 : 2;
-      const by = e.y - e.size - (e.isBoss ? 12 : 6);
-      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(e.x - bw / 2, by, bw, bh);
-      const hpCol = e.isBoss ? '#ffcc44' : '#ff4466';
-      ctx.fillStyle = hpCol; ctx.fillRect(e.x - bw / 2, by, bw * (e.hp / e.maxHp), bh);
-      if (e.isBoss) {
-        ctx.strokeStyle = 'rgba(255,204,68,0.4)'; ctx.lineWidth = 0.5;
-        ctx.strokeRect(e.x - bw / 2, by, bw, bh);
+    // HP bar for tough enemies / boss stacked single bar
+    if (e.isBoss && e.shields) {
+      // ── Boss single stacked HP bar ──
+      // One bar. Each layer covers the full bar width. Layers are painted
+      // back-to-front: core(red) → shield2(yellow) → shield1(green) → shield0(blue).
+      // A layer's visible width = (its remaining HP / its maxHP) * barWidth.
+      // When shield0 (blue) is at 60%, you see blue covering 60% and green
+      // peeking out for the remaining 40%. When blue is gone, the full green bar
+      // is revealed underneath.
+      const bw = e.size * 3;
+      const bh = 5;
+      const bx = e.x - bw / 2;
+      const by = e.y - e.size - 14;
+
+      // Phase break flash
+      if (e.phaseBreakFlash > 0) {
+        ctx.save();
+        ctx.globalAlpha = e.phaseBreakFlash * 0.5;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
+        ctx.restore();
       }
+
+      // Background
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx, by, bw, bh);
+
+      // Draw back-to-front: core first, then shields in reverse order
+      // Core: fraction of core HP
+      const coreFrac = e.hp / e.maxHp;
+      if (coreFrac > 0) {
+        ctx.fillStyle = '#ff4466';
+        ctx.fillRect(bx, by, bw * coreFrac, bh);
+      }
+      // Shields back-to-front (2→1→0)
+      for (let si = e.shields.length - 1; si >= 0; si--) {
+        const sh = e.shields[si];
+        if (sh.hp > 0) {
+          const frac = sh.hp / sh.maxHp;
+          ctx.fillStyle = sh.color;
+          ctx.fillRect(bx, by, bw * frac, bh);
+        }
+      }
+
+      // Shimmer highlight on top half of the visible fill
+      const activeSh = e.shieldIdx < e.shields.length ? e.shields[e.shieldIdx] : null;
+      const topFrac = activeSh ? activeSh.hp / activeSh.maxHp : coreFrac;
+      if (topFrac > 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        ctx.fillRect(bx, by, bw * topFrac, bh / 2);
+      }
+
+      // Border color = active layer color
+      const activeColor = e.shieldIdx < e.shields.length
+        ? e.shields[e.shieldIdx].color
+        : '#ff4466';
+      ctx.strokeStyle = activeColor;
+      ctx.lineWidth = 0.8;
+      ctx.strokeRect(bx, by, bw, bh);
+
+      // Phase attack timer arc around boss
+      if (e.shieldIdx < e.shields.length) {
+        const timerFrac = e.phaseAttackTimer / e.phaseAttackInterval;
+        const timerAngle = TAU * timerFrac;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, e.size + 6, -PI / 2, -PI / 2 + timerAngle);
+        ctx.strokeStyle = timerFrac > 0.75
+          ? `rgba(255,${Math.floor(80 * (1 - timerFrac))},50,${0.6 + timerFrac * 0.4})`
+          : 'rgba(255,180,50,0.4)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    } else if (e.isBoss) {
+      // Fallback boss bar (no shield data)
+      const bw = e.size * 3;
+      const bh = 5;
+      const by = e.y - e.size - 14;
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(e.x - bw / 2, by, bw, bh);
+      ctx.fillStyle = '#ff4466'; ctx.fillRect(e.x - bw / 2, by, bw * (e.hp / e.maxHp), bh);
+      ctx.strokeStyle = 'rgba(255,68,102,0.4)'; ctx.lineWidth = 0.5;
+      ctx.strokeRect(e.x - bw / 2, by, bw, bh);
+    } else if (e.maxHp > 50 && e.hp < e.maxHp) {
+      const bw = e.size * 2;
+      const bh = 2;
+      const by = e.y - e.size - 6;
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(e.x - bw / 2, by, bw, bh);
+      ctx.fillStyle = '#ff4466'; ctx.fillRect(e.x - bw / 2, by, bw * (e.hp / e.maxHp), bh);
     }
 
-    // Boss label
+    // Boss label — just "BOSS", no phase text
     if (e.isBoss) {
-      ctx.font = "bold 10px 'Satoshi',sans-serif"; ctx.fillStyle = '#ffcc44';
+      ctx.font = "bold 10px 'Satoshi',sans-serif";
+      ctx.fillStyle = '#ffcc44';
       ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-      ctx.fillText('BOSS', e.x, e.y - e.size - 14);
+      ctx.fillText('BOSS', e.x, e.y - e.size - 16);
     }
 
     // Jammer-resist indicator label
@@ -1901,7 +2223,7 @@ function renderScraps() {
 }
 
 function renderHUD() {
-  if (G.phase === 'title' || G.phase === 'gameover') return;
+  if (G.phase === 'title' || G.phase === 'gameover' || G.phase === 'sinking') return;
   ctx.save();
   const mobile = W < 600;
   // Top bar
@@ -2566,18 +2888,26 @@ function renderTitle() {
 
 function renderGameOver() {
   ctx.save();
-  ctx.fillStyle = 'rgba(5,10,20,0.8)'; ctx.fillRect(0, 0, W, H);
+  // Semi-transparent overlay so sinking ship shows through
+  ctx.fillStyle = 'rgba(5,10,20,0.55)'; ctx.fillRect(0, 0, W, H);
+  // Vignette — darker at edges, lighter in center where ship is
+  const vig = ctx.createRadialGradient(CX, CY + 40, 50, CX, CY + 40, Math.max(W, H) * 0.6);
+  vig.addColorStop(0, 'rgba(5,10,20,0)');
+  vig.addColorStop(1, 'rgba(5,10,20,0.35)');
+  ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
+
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.shadowColor = 'rgba(255,68,102,0.5)'; ctx.shadowBlur = 30;
-  ctx.font = "800 52px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#ff4466';
-  ctx.fillText('SUNK', CX, CY - 55); ctx.shadowBlur = 0;
+  // SUNK title — positioned higher so ship sinking area is visible
+  ctx.shadowColor = 'rgba(255,68,102,0.6)'; ctx.shadowBlur = 40;
+  ctx.font = "800 56px 'Cabinet Grotesk',sans-serif"; ctx.fillStyle = '#ff4466';
+  ctx.fillText('SUNK', CX, CY - 80); ctx.shadowBlur = 0;
   ctx.font = "500 17px 'Satoshi',sans-serif"; ctx.fillStyle = '#aabbcc';
-  ctx.fillText(`Wave ${G.wave + 1} まで到達`, CX, CY - 5);
-  ctx.fillText(`スコア: ${G.score}  撃墜: ${G.kills}`, CX, CY + 25);
+  ctx.fillText(`Wave ${G.wave + 1} まで到達`, CX, CY - 30);
+  ctx.fillText(`スコア: ${G.score}  撃墜: ${G.kills}`, CX, CY);
   const pulse = 0.6 + Math.sin(G.time * 3) * 0.4;
   ctx.font = "700 18px 'Cabinet Grotesk',sans-serif";
   ctx.fillStyle = `rgba(255,255,255,${pulse})`;
-  ctx.fillText('TAP TO RETRY', CX, CY + 85);
+  ctx.fillText('TAP TO RETRY', CX, CY + 60);
   ctx.restore();
 }
 
@@ -2647,6 +2977,7 @@ function resetGame() {
   G.enemies = []; G.bullets = []; G.scraps = []; G.torpedoes = [];
   G.spawnQueues = []; G.notifications = [];
   G.dmgFlash = 0; shakeAmt = 0;
+  G.sink = null; G.announce = null;
   particles.length = 0;
   G.ship.hp = G.ship.maxHp;
   G.res = { iron: 10, gunpowder: 5, electronics: 1, brass: 1 };
@@ -2681,12 +3012,19 @@ window.render_game_to_text = () => JSON.stringify({
   shipHp: G.ship.hp, enemies: G.enemies.length,
   bullets: G.bullets.length, torpedoes: G.torpedoes.length,
   scraps: G.scraps.length, resources: G.res,
+  sink: G.sink ? { timer: G.sink.timer.toFixed(2), phase: G.sink.phase, yOffset: G.sink.yOffset.toFixed(1) } : null,
   turrets: G.ship.slots.filter(s => s.turret).map(s => ({
     type: s.turret.type, slot: s.id, level: s.turret.level,
     angle: (s.turret.angle / DEG).toFixed(0) + '°',
   })),
   pointers: pointers.size,
 });
+// Test hook: force sinking animation for QA
+window.testSinking = () => {
+  if (G.phase !== 'playing' && G.phase !== 'building') return;
+  G.ship.hp = 0;
+  G.phase = 'playing'; // ensure death check triggers
+};
 
 // Mute
 addEventListener('keydown', e => {
